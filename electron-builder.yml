@@ -1,0 +1,33 @@
+appId: com.sshrelay.studio
+productName: SSH Relay Studio
+copyright: Copyright © 2026 SSH Relay Studio
+compression: normal
+electronLanguages:
+  - zh-CN
+  - en-US
+directories:
+  output: release
+  buildResources: resources
+files:
+  - dist/**/*
+  - resources/**/*
+  - package.json
+extraResources:
+  - from: resources
+    to: resources
+extraMetadata:
+  main: dist/main/main/main.js
+win:
+  target:
+    - target: zip
+      arch:
+        - x64
+  icon: resources/icon.ico
+  signAndEditExecutable: false
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+portable:
+  artifactName: "${productName}-${version}-portable-x64.exe"

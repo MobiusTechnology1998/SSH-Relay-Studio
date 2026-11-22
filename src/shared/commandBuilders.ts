@@ -1,0 +1,158 @@
+import type { BrowserPrefs, NodeProfile } from './types';
+
+/**
+ * Builds the exact ssh.exe argument array for either:
+ * - Standard SOCKS5 dynamic tunnel (`ssh -D 127.0.0.1:<localPort>`)
+ * - Local port forward to Device B's local proxy (`ssh -L 127.0.0.1:<localPort>:127.0.0.1:<remoteProxyPort>`)
+ */
+export function buildSshTunnelArgs(node: NodeProfile, resolvedKeyPath?: string): string[] {
+  const args: string[] = ['-p', String(node.sshPort)];
+
+  if (node.mode === 'localForward') {
+    args.push('-L', `127.0.0.1:${node.localPort}:127.0.0.1:${node.remoteProxyPort}`);
+  } else {
+    args.push('-D', `127.0.0.1:${node.localPort}`);
+  }
+
+  args.push(
+    '-C',
+    '-N',
+    '-o',
+    'ServerAliveInterval=30',
+    '-o',
+    'ServerAliveCountMax=3',
+    '-o',
+    'ConnectTimeout=10',
+    '-o',
+    'ExitOnForwardFailure=yes',
+    '-o',
+    'BatchMode=yes'
+  );
+
+  const keyPath = (resolvedKeyPath || node.privateKeyPath || '').trim();
+  if (keyPath) {
+    args.push('-i', keyPath);
+  }
+
+  args.push(`${node.username}@${node.host}`);
+  return args;
+}
+
+/**
+ * Formats a human-readable ssh command preview string.
+ */
+export function formatSshCommandPreview(node: NodeProfile, resolvedKeyPath?: string): string {
+  const args = buildSshTunnelArgs(node, resolvedKeyPath).map((arg) =>
+    /\s/.test(arg) ? `"${arg}"` : arg
+  );
+  return `ssh ${args.join(' ')}`;
+}
+
+/**
+ * Builds Chromium (Edge / Chrome) arguments for isolated full-site proxy browsing.
+ * Per ssh.md 5.3 & 6: avoids `--host-resolver-rules` by default to prevent warning banners,
+ * and allows opting in for strict corporate intranets.
+ */
+export function buildBrowserLaunchArgs(
+  node: Pick<NodeProfile, 'mode' | 'localPort'>,
+  prefs: BrowserPrefs,
+  resolvedUserDataDir: string
+): string[] {
+  const proxyScheme = node.mode === 'localForward' ? 'http' : 'socks5';
+  const args: string[] = [
+    `--proxy-server=${proxyScheme}://127.0.0.1:${node.localPort}`,
+    `--user-data-dir=${resolvedUserDataDir}`,
+  ];
+
+  if (prefs.useHostResolverRules) {
+    args.push('--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1');
+  }
+
+  if (prefs.startUrl && prefs.startUrl.trim()) {
+    args.push(prefs.startUrl.trim());
+  }
+
+  return args;
+}
+
+export interface TerminalProxySnippets {
+  powershell: string;
+  cmd: string;
+  bash: string;
+  curlTest: string;
+}
+
+/**
+ * Generates copy-pasteable terminal environment variable snippets for API / CLI use.
+ */
+export function buildTerminalProxySnippets(
+  node: Pick<NodeProfile, 'mode' | 'localPort'>
+): TerminalProxySnippets {
+  const url =
+    node.mode === 'localForward'
+      ? `http://127.0.0.1:${node.localPort}`
+      : `socks5h://127.0.0.1:${node.localPort}`;
+
+  const curlFlag =
+    node.mode === 'localForward'
+      ? `--proxy http://127.0.0.1:${node.localPort}`
+      : `--socks5-hostname 127.0.0.1:${node.localPort}`;
+
+  return {
+    powershell: `$env:HTTP_PROXY="${url}"\n$env:HTTPS_PROXY="${url}"`,
+    cmd: `set HTTP_PROXY=${url}\nset HTTPS_PROXY=${url}`,
+    bash: `export HTTP_PROXY="${url}"\nexport HTTPS_PROXY="${url}"`,
+    curlTest: `curl.exe ${curlFlag} https://api.ipify.org`,
+  };
+}
+
+/**
+ * Translates common OpenSSH stderr outputs into actionable Chinese diagnostic hints
+ * grounded directly in ssh.md troubleshooting rules.
+ */
+export function diagnoseSshError(stderr: string): string | null {
+  const lower = stderr.toLowerCase();
+
+  if (
+    lower.includes('host key verification failed') ||
+    lower.includes('offending') ||
+    lower.includes('remote host identification has changed')
+  ) {
+    return '主机指纹尚未信任或已变更（换端口后需重新信任）。请前往「密钥与配对」点击「扫描并信任主机指纹」。';
+  }
+
+  if (lower.includes('permission denied (publickey')) {
+    return '公钥认证被拒绝：请确认已将设备 A 公钥追加到设备 B 的 C:\\ProgramData\\ssh\\administrators_authorized_keys，并在 B 端执行了 icacls 权限收紧。';
+  }
+
+  if (lower.includes('connection refused')) {
+    return '连接被拒绝：请检查设备 B 的 sshd 服务是否正在运行、sshd_config 端口是否正确，以及防火墙/云安全组是否已放行该端口。';
+  }
+
+  if (lower.includes('connection timed out') || lower.includes('timed out')) {
+    return '连接超时：请检查设备 B 的公网 IP、云平台安全组入方向规则，以及设备 A 与设备 B 之间的网络连通性。';
+  }
+
+  if (
+    lower.includes('could not request local forwarding') ||
+    lower.includes('address already in use') ||
+    lower.includes('cannot listen to port')
+  ) {
+    return '本地代理端口被占用：请更换本地端口（如 1081）或关闭正在占用该端口的旧 ssh.exe / 代理程序。';
+  }
+
+  if (lower.includes('no such file or directory') && lower.includes('identity')) {
+    return '找不到私钥文件：请前往「密钥与配对」重新生成 ed25519 密钥对，或检查节点配置中的私钥路径。';
+  }
+
+  return null;
+}
+
+/**
+ * Formats a known_hosts host identifier matching OpenSSH conventions:
+ * Port 22 -> `host`, non-22 -> `[host]:port`.
+ */
+export function formatKnownHostsTarget(host: string, port: number): string {
+  const cleanHost = host.trim();
+  return port === 22 ? cleanHost : `[${cleanHost}]:${port}`;
+}
