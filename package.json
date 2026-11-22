@@ -1,7 +1,7 @@
 {
   "name": "ssh-relay-desktop",
   "productName": "SSH Relay Studio",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "A/B 设备双角色 Windows OpenSSH 加密隧道中转桌面管理工具",
   "author": "SSH Relay Studio",
   "private": true,

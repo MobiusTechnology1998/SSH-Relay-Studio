@@ -240,7 +240,7 @@ export const ClientTools: React.FC<ClientToolsProps> = ({
 
         <div className="field">
           <label className="field-label">
-            独立用户数据目录（留空则默认使用 %LOCALAPPDATA%\Edge-GPT 或 Chrome-GPT）
+            独立用户数据目录（留空则默认使用 %LOCALAPPDATA%\Edge 或 Chrome，支持环境变量）
           </label>
           <input
             className="input mono"

@@ -14,13 +14,36 @@ export function buildSshTunnelArgs(node: NodeProfile, resolvedKeyPath?: string):
     args.push('-D', `127.0.0.1:${node.localPort}`);
   }
 
+  if (node.compression === true) {
+    args.push('-C');
+  }
+
+  const aliveInterval =
+    typeof node.serverAliveInterval === 'number' &&
+    Number.isInteger(node.serverAliveInterval) &&
+    node.serverAliveInterval >= 5 &&
+    node.serverAliveInterval <= 300
+      ? node.serverAliveInterval
+      : 15;
+
+  const aliveCountMax =
+    typeof node.serverAliveCountMax === 'number' &&
+    Number.isInteger(node.serverAliveCountMax) &&
+    node.serverAliveCountMax >= 1 &&
+    node.serverAliveCountMax <= 20
+      ? node.serverAliveCountMax
+      : 3;
+
   args.push(
-    '-C',
     '-N',
     '-o',
-    'ServerAliveInterval=30',
+    `ServerAliveInterval=${aliveInterval}`,
     '-o',
-    'ServerAliveCountMax=3',
+    `ServerAliveCountMax=${aliveCountMax}`,
+    '-o',
+    'TCPKeepAlive=yes',
+    '-o',
+    'IPQoS=none',
     '-o',
     'ConnectTimeout=10',
     '-o',
@@ -145,7 +168,71 @@ export function diagnoseSshError(stderr: string): string | null {
     return '找不到私钥文件：请前往「密钥与配对」重新生成 ed25519 密钥对，或检查节点配置中的私钥路径。';
   }
 
+  if (
+    lower.includes('connection reset') ||
+    lower.includes('broken pipe') ||
+    lower.includes('client_loop: send disconnect')
+  ) {
+    return '隧道 TCP 连接被对端或中间网络重置（Connection reset）：已自动触发重连。若频繁发生，建议在设备 B 开启 sshd 服务端保活（ClientAliveInterval）并确认节点未开启 SSH 压缩（-C）。';
+  }
+
   return null;
+}
+
+/**
+ * Decodes OpenSSH octal-escaped byte sequences (e.g. `\262\273...` from Chinese Windows GBK messages)
+ * into readable UTF-8 / GB18030 text.
+ */
+export function decodeOpenSshOctalEscapes(text: string): string {
+  if (!text.includes('\\')) return text;
+
+  return text.replace(/(?:\\[0-3][0-7]{2})+/g, (match) => {
+    const tokens = match.match(/\\[0-3][0-7]{2}/g);
+    if (!tokens || tokens.length === 0) return match;
+
+    const bytes = Uint8Array.from(tokens.map((t) => Number.parseInt(t.slice(1), 8)));
+
+    // Only attempt decoding if high-bit bytes are present (avoid mangling literal ASCII escapes)
+    if (!bytes.some((b) => b >= 0x80)) {
+      return match;
+    }
+
+    try {
+      return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    } catch {
+      try {
+        return new TextDecoder('gb18030', { fatal: false }).decode(bytes);
+      } catch {
+        return match;
+      }
+    }
+  });
+}
+
+/**
+ * Decodes raw stdout/stderr buffer from OpenSSH (handling both UTF-8 and Windows GBK/GB18030)
+ * and expands OpenSSH octal escapes.
+ */
+export function decodeSshOutputChunk(chunk: Uint8Array): string {
+  let text: string;
+  try {
+    text = new TextDecoder('utf-8', { fatal: true }).decode(chunk);
+  } catch {
+    try {
+      text = new TextDecoder('gb18030', { fatal: false }).decode(chunk);
+    } catch {
+      text = new TextDecoder('utf-8', { fatal: false }).decode(chunk);
+    }
+  }
+  return decodeOpenSshOctalEscapes(text);
+}
+
+/**
+ * Returns true for non-fatal single-channel dynamic forwarding errors
+ * (e.g. browser background DNS probe failing on Device B), which do not drop the main SSH tunnel.
+ */
+export function isNonFatalChannelOpenError(line: string): boolean {
+  return /^channel\s+\d+:\s+open failed:/i.test(line.trim());
 }
 
 /**

@@ -97,6 +97,9 @@ export const ServerDeploy: React.FC<ServerDeployProps> = ({
         port: targetPort,
         pubkeyAuthentication: true,
         passwordAuthentication: false,
+        tcpKeepAlive: true,
+        clientAliveInterval: 30,
+        clientAliveCountMax: 3,
       });
       if (!cfgRes.ok) {
         onNotify('error', cfgRes.message);

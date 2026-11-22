@@ -22,6 +22,9 @@ export function readSshdConfigState(): SshdConfigState {
       port: 22,
       pubkeyAuthentication: true,
       passwordAuthentication: true,
+      tcpKeepAlive: true,
+      clientAliveInterval: 0,
+      clientAliveCountMax: 3,
       hasMatchAdminBlock: false,
       rawContent: '',
     };
@@ -36,6 +39,9 @@ export function readSshdConfigState(): SshdConfigState {
     port: parsed.port,
     pubkeyAuthentication: parsed.pubkeyAuthentication,
     passwordAuthentication: parsed.passwordAuthentication,
+    tcpKeepAlive: parsed.tcpKeepAlive,
+    clientAliveInterval: parsed.clientAliveInterval,
+    clientAliveCountMax: parsed.clientAliveCountMax,
     hasMatchAdminBlock: parsed.hasMatchAdminBlock,
     rawContent,
   };
@@ -99,9 +105,13 @@ export async function applySshdConfigUpdate(
     return { ok: false, message: msg, data: readSshdConfigState() };
   }
 
+  const keepaliveSummary =
+    update.clientAliveInterval !== undefined
+      ? `, TCPKeepAlive=${update.tcpKeepAlive === false ? 'no' : 'yes'}, ClientAliveInterval=${update.clientAliveInterval}`
+      : '';
   logger.success(
     'serverB',
-    `sshd_config 已更新并通过 sshd.exe -t 校验 (Port=${update.port}, Pubkey=${update.pubkeyAuthentication ? 'yes' : 'no'}, Password=${update.passwordAuthentication ? 'yes' : 'no'})`
+    `sshd_config 已更新并通过 sshd.exe -t 校验 (Port=${update.port}, Pubkey=${update.pubkeyAuthentication ? 'yes' : 'no'}, Password=${update.passwordAuthentication ? 'yes' : 'no'}${keepaliveSummary})`
   );
 
   return {

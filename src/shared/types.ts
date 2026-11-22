@@ -13,13 +13,16 @@ export interface NodeProfile {
   remoteProxyPort: number; // Used when mode === 'localForward' (e.g. 7890 for Clash/v2rayN on B)
   privateKeyPath: string; // Empty means default ~/.ssh/id_ed25519
   expectedHostKey?: string; // Optional host public key from B pairing token
+  compression?: boolean; // Default false (HTTPS/TLS does not benefit from SSH -C)
+  serverAliveInterval?: number; // Default 15 seconds
+  serverAliveCountMax?: number; // Default 3
   notes?: string;
 }
 
 export interface BrowserPrefs {
   selectedBrowser: 'edge' | 'chrome' | 'custom';
   customBrowserPath: string;
-  userDataDir: string; // Empty means default %LOCALAPPDATA%\SSHRelay-<Browser>
+  userDataDir: string; // Empty means default %LOCALAPPDATA%\Edge or Chrome
   useHostResolverRules: boolean; // Default false per ssh.md 5.3 & 6
   startUrl: string;
 }
@@ -157,6 +160,9 @@ export interface SshdConfigState {
   port: number;
   pubkeyAuthentication: boolean;
   passwordAuthentication: boolean;
+  tcpKeepAlive: boolean;
+  clientAliveInterval: number;
+  clientAliveCountMax: number;
   hasMatchAdminBlock: boolean;
   rawContent: string;
 }

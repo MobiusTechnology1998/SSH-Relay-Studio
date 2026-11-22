@@ -19,6 +19,15 @@ export const ServerHardening: React.FC<ServerHardeningProps> = ({
   const [passwordAuth, setPasswordAuth] = useState(
     overview?.config.passwordAuthentication ?? false
   );
+  const [tcpKeepAlive, setTcpKeepAlive] = useState(overview?.config.tcpKeepAlive ?? true);
+  const [clientAliveInterval, setClientAliveInterval] = useState(
+    overview?.config.clientAliveInterval && overview.config.clientAliveInterval > 0
+      ? overview.config.clientAliveInterval
+      : 30
+  );
+  const [clientAliveCountMax, setClientAliveCountMax] = useState(
+    overview?.config.clientAliveCountMax ?? 3
+  );
   const [customFwPort, setCustomFwPort] = useState(53622);
   const [busy, setBusy] = useState(false);
 
@@ -27,8 +36,20 @@ export const ServerHardening: React.FC<ServerHardeningProps> = ({
     setPort(overview.config.port);
     setPubkeyAuth(overview.config.pubkeyAuthentication);
     setPasswordAuth(overview.config.passwordAuthentication);
+    setTcpKeepAlive(overview.config.tcpKeepAlive);
+    setClientAliveInterval(
+      overview.config.clientAliveInterval > 0 ? overview.config.clientAliveInterval : 30
+    );
+    setClientAliveCountMax(overview.config.clientAliveCountMax || 3);
     setCustomFwPort(overview.config.port === 22 ? 53622 : overview.config.port);
-  }, [overview?.config.port, overview?.config.pubkeyAuthentication, overview?.config.passwordAuthentication]);
+  }, [
+    overview?.config.port,
+    overview?.config.pubkeyAuthentication,
+    overview?.config.passwordAuthentication,
+    overview?.config.tcpKeepAlive,
+    overview?.config.clientAliveInterval,
+    overview?.config.clientAliveCountMax,
+  ]);
 
   const handleSaveSshdConfig = async (andRestart: boolean) => {
     if (!passwordAuth && (!overview || overview.authorizedKeys.keys.length === 0)) {
@@ -41,6 +62,9 @@ export const ServerHardening: React.FC<ServerHardeningProps> = ({
         port,
         pubkeyAuthentication: pubkeyAuth,
         passwordAuthentication: passwordAuth,
+        tcpKeepAlive,
+        clientAliveInterval,
+        clientAliveCountMax,
       });
       if (!res.ok) {
         onNotify('error', res.message);
@@ -175,6 +199,43 @@ export const ServerHardening: React.FC<ServerHardeningProps> = ({
               />
               <span>关闭密码登录 (PasswordAuthentication no)</span>
             </label>
+          </div>
+        </div>
+
+        <div className="grid-3">
+          <div className="field" style={{ justifyContent: 'center' }}>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={tcpKeepAlive}
+                onChange={(e) => setTcpKeepAlive(e.target.checked)}
+              />
+              <span>TCPKeepAlive yes（防止 NAT/防火墙踢断）</span>
+            </label>
+          </div>
+
+          <div className="field">
+            <label className="field-label">服务端心跳间隔 ClientAliveInterval（秒）</label>
+            <input
+              className="input mono"
+              type="number"
+              min={0}
+              max={3600}
+              value={clientAliveInterval}
+              onChange={(e) => setClientAliveInterval(Math.max(0, Number(e.target.value) || 0))}
+            />
+          </div>
+
+          <div className="field">
+            <label className="field-label">心跳最大重试 ClientAliveCountMax</label>
+            <input
+              className="input mono"
+              type="number"
+              min={1}
+              max={20}
+              value={clientAliveCountMax}
+              onChange={(e) => setClientAliveCountMax(Math.max(1, Number(e.target.value) || 3))}
+            />
           </div>
         </div>
 

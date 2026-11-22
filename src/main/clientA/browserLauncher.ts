@@ -56,15 +56,36 @@ export function detectInstalledBrowsers(): DetectedBrowser[] {
   ];
 }
 
+/**
+ * Expands Windows-style `%VAR%` environment variables (case-insensitive)
+ * because `child_process.spawn` with `shell: false` does not expand them automatically.
+ */
+export function expandWindowsEnvVars(
+  input: string,
+  env: Record<string, string | undefined> = process.env
+): string {
+  if (!input.includes('%')) return input;
+  const envLookup = new Map<string, string>();
+  for (const [k, v] of Object.entries(env)) {
+    if (typeof v === 'string') {
+      envLookup.set(k.toUpperCase(), v);
+    }
+  }
+  return input.replace(/%([^%]+)%/g, (match, varName: string) => {
+    const resolved = envLookup.get(varName.toUpperCase());
+    return resolved !== undefined ? resolved : match;
+  });
+}
+
 export function resolveDefaultBrowserProfileDir(browserId: BrowserPrefs['selectedBrowser']): string {
   const localAppData =
     process.env.LOCALAPPDATA || path.join(os.homedir(), '.local', 'share');
   const folderName =
     browserId === 'chrome'
-      ? 'Chrome-GPT'
+      ? 'Chrome'
       : browserId === 'edge'
-      ? 'Edge-GPT'
-      : 'Browser-GPT';
+      ? 'Edge'
+      : 'Browser';
   return path.join(localAppData, folderName);
 }
 
@@ -76,7 +97,7 @@ export function launchProxyBrowser(
   let exePath = '';
 
   if (prefs.selectedBrowser === 'custom') {
-    exePath = prefs.customBrowserPath.trim();
+    exePath = expandWindowsEnvVars(prefs.customBrowserPath.trim());
   } else {
     const match = detected.find((b) => b.id === prefs.selectedBrowser);
     exePath = match?.path || '';
@@ -93,8 +114,10 @@ export function launchProxyBrowser(
     };
   }
 
-  const userDataDir =
-    prefs.userDataDir.trim() || resolveDefaultBrowserProfileDir(prefs.selectedBrowser);
+  const rawUserDataDir = prefs.userDataDir.trim();
+  const userDataDir = rawUserDataDir
+    ? expandWindowsEnvVars(rawUserDataDir)
+    : resolveDefaultBrowserProfileDir(prefs.selectedBrowser);
   const args = buildBrowserLaunchArgs(node, prefs, userDataDir);
 
   try {

@@ -64,6 +64,30 @@ describe('sshConfigParser', () => {
     expect(parseSshdConfig(updated).port).toBe(53622);
   });
 
+  it('writes keepalive directives before Match block and reparses them accurately', () => {
+    const updated = updateSshdConfig(DEFAULT_WIN_SSHD_CONFIG, {
+      port: 53622,
+      pubkeyAuthentication: true,
+      passwordAuthentication: false,
+      tcpKeepAlive: true,
+      clientAliveInterval: 30,
+      clientAliveCountMax: 3,
+    });
+
+    const matchIdx = updated.indexOf('Match Group administrators');
+    expect(updated.indexOf('TCPKeepAlive yes')).toBeGreaterThan(-1);
+    expect(updated.indexOf('TCPKeepAlive yes')).toBeLessThan(matchIdx);
+    expect(updated.indexOf('ClientAliveInterval 30')).toBeGreaterThan(-1);
+    expect(updated.indexOf('ClientAliveInterval 30')).toBeLessThan(matchIdx);
+    expect(updated.indexOf('ClientAliveCountMax 3')).toBeGreaterThan(-1);
+    expect(updated.indexOf('ClientAliveCountMax 3')).toBeLessThan(matchIdx);
+
+    const reparsed = parseSshdConfig(updated);
+    expect(reparsed.tcpKeepAlive).toBe(true);
+    expect(reparsed.clientAliveInterval).toBe(30);
+    expect(reparsed.clientAliveCountMax).toBe(3);
+  });
+
   it('rejects out-of-range ports', () => {
     expect(() =>
       updateSshdConfig(DEFAULT_WIN_SSHD_CONFIG, {

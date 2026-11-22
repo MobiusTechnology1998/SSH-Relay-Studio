@@ -22,6 +22,9 @@ function createEmptyNode(): NodeProfile {
     localPort: 1080,
     remoteProxyPort: 7890,
     privateKeyPath: '',
+    compression: false,
+    serverAliveInterval: 15,
+    serverAliveCountMax: 3,
     notes: '',
   };
 }
@@ -338,6 +341,52 @@ export const ClientNodes: React.FC<ClientNodesProps> = ({
                 </button>
               </div>
             </div>
+
+            <div className="grid-2">
+              <div className="field">
+                <label className="field-label">心跳保活间隔 ServerAliveInterval（秒）</label>
+                <input
+                  className="input mono"
+                  type="number"
+                  min={5}
+                  max={300}
+                  value={editing.serverAliveInterval ?? 15}
+                  onChange={(e) =>
+                    setEditing({
+                      ...editing,
+                      serverAliveInterval: Math.max(5, Number(e.target.value) || 15),
+                    })
+                  }
+                />
+                <span className="field-hint">默认 15 秒，搭配 IPQoS=none 与 TCPKeepAlive=yes 防断流</span>
+              </div>
+              <div className="field">
+                <label className="field-label">心跳最大重试 ServerAliveCountMax</label>
+                <input
+                  className="input mono"
+                  type="number"
+                  min={1}
+                  max={20}
+                  value={editing.serverAliveCountMax ?? 3}
+                  onChange={(e) =>
+                    setEditing({
+                      ...editing,
+                      serverAliveCountMax: Math.max(1, Number(e.target.value) || 3),
+                    })
+                  }
+                />
+                <span className="field-hint">连续无响应此次数后自动触发重连（默认 3 次）</span>
+              </div>
+            </div>
+
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={Boolean(editing.compression)}
+                onChange={(e) => setEditing({ ...editing, compression: e.target.checked })}
+              />
+              <span>启用 SSH 压缩（-C，日常浏览 HTTPS 网页建议保持关闭以降低抖动与延迟）</span>
+            </label>
 
             {editing.host.trim() && (
               <div className="field">

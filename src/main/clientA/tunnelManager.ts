@@ -1,7 +1,12 @@
 import { ChildProcess, spawn } from 'child_process';
 import os from 'os';
 import path from 'path';
-import { buildSshTunnelArgs, diagnoseSshError } from '../../shared/commandBuilders';
+import {
+  buildSshTunnelArgs,
+  decodeSshOutputChunk,
+  diagnoseSshError,
+  isNonFatalChannelOpenError,
+} from '../../shared/commandBuilders';
 import type { ActionResult, NodeProfile, TunnelStatus } from '../../shared/types';
 import { logger } from '../logger';
 import {
@@ -169,15 +174,40 @@ class TunnelManager {
     });
 
     child.stdout?.on('data', (chunk: Buffer) => {
-      const text = chunk.toString('utf8').trim();
+      const text = decodeSshOutputChunk(chunk).trim();
       if (text) logger.info('tunnel', text);
     });
 
     child.stderr?.on('data', (chunk: Buffer) => {
-      const text = chunk.toString('utf8').trim();
-      if (text) {
-        this.stderrBuffer += `${text}\n`;
-        logger.warn('tunnel', text);
+      const text = decodeSshOutputChunk(chunk);
+      const lines = text
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter(Boolean);
+
+      for (const line of lines) {
+        if (isNonFatalChannelOpenError(line)) {
+          const lower = line.toLowerCase();
+          const isDnsMiss =
+            line.includes('不知道这样的主机') ||
+            lower.includes('no such host is known') ||
+            lower.includes('name or service not known');
+          logger.info(
+            'tunnel',
+            isDnsMiss
+              ? `${line}（单条请求目标域名解析失败，不影响主隧道）`
+              : `${line}（单条子通道失败，不影响主隧道）`
+          );
+          continue;
+        }
+
+        const existingLines = this.stderrBuffer
+          .split('\n')
+          .map((l) => l.trim())
+          .filter(Boolean);
+        existingLines.push(line);
+        this.stderrBuffer = existingLines.slice(-8).join('\n');
+        logger.warn('tunnel', line);
       }
     });
 

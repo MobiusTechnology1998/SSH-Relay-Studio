@@ -2,6 +2,9 @@ export interface ParsedSshdConfig {
   port: number;
   pubkeyAuthentication: boolean;
   passwordAuthentication: boolean;
+  tcpKeepAlive: boolean;
+  clientAliveInterval: number;
+  clientAliveCountMax: number;
   hasMatchAdminBlock: boolean;
 }
 
@@ -9,6 +12,9 @@ export interface SshdConfigUpdate {
   port: number;
   pubkeyAuthentication: boolean;
   passwordAuthentication: boolean;
+  tcpKeepAlive?: boolean;
+  clientAliveInterval?: number;
+  clientAliveCountMax?: number;
 }
 
 const MATCH_LINE_RE = /^\s*Match\s+/i;
@@ -16,13 +22,16 @@ const MATCH_LINE_RE = /^\s*Match\s+/i;
 /**
  * Parse key directives from Windows OpenSSH sshd_config.
  * Only inspects global section (lines prior to any `Match` block) for Port,
- * PubkeyAuthentication, and PasswordAuthentication.
+ * PubkeyAuthentication, PasswordAuthentication, and keepalive directives.
  */
 export function parseSshdConfig(content: string): ParsedSshdConfig {
   const lines = content.split(/\r?\n/);
   let port = 22;
   let pubkeyAuthentication = true; // OpenSSH default is yes
   let passwordAuthentication = true; // OpenSSH default is yes
+  let tcpKeepAlive = true; // OpenSSH default is yes
+  let clientAliveInterval = 0; // OpenSSH default is 0 (disabled)
+  let clientAliveCountMax = 3; // OpenSSH default is 3
   let hasMatchAdminBlock = false;
   let inMatchBlock = false;
 
@@ -60,18 +69,46 @@ export function parseSshdConfig(content: string): ParsedSshdConfig {
       passwordAuthentication = passMatch[1].toLowerCase() === 'yes';
       continue;
     }
+
+    const tcpKeepAliveMatch = trimmed.match(/^TCPKeepAlive\s+(yes|no)\b/i);
+    if (tcpKeepAliveMatch) {
+      tcpKeepAlive = tcpKeepAliveMatch[1].toLowerCase() === 'yes';
+      continue;
+    }
+
+    const clientAliveIntervalMatch = trimmed.match(/^ClientAliveInterval\s+(\d+)\b/i);
+    if (clientAliveIntervalMatch) {
+      const parsed = Number.parseInt(clientAliveIntervalMatch[1], 10);
+      if (parsed >= 0 && parsed <= 86400) {
+        clientAliveInterval = parsed;
+      }
+      continue;
+    }
+
+    const clientAliveCountMaxMatch = trimmed.match(/^ClientAliveCountMax\s+(\d+)\b/i);
+    if (clientAliveCountMaxMatch) {
+      const parsed = Number.parseInt(clientAliveCountMaxMatch[1], 10);
+      if (parsed >= 1 && parsed <= 100) {
+        clientAliveCountMax = parsed;
+      }
+      continue;
+    }
   }
 
   return {
     port,
     pubkeyAuthentication,
     passwordAuthentication,
+    tcpKeepAlive,
+    clientAliveInterval,
+    clientAliveCountMax,
     hasMatchAdminBlock,
   };
 }
 
 /**
- * Safely updates Port, PubkeyAuthentication, and PasswordAuthentication in sshd_config.
+ * Safely updates Port, PubkeyAuthentication, PasswordAuthentication, and optional keepalive directives
+ * in sshd_config.
  * - Replaces existing active or commented directive lines in the global section (before any `Match` block).
  * - Preserves `Match Group administrators` and all unrelated comments/directives intact.
  * - Inserts missing directives right before the first `Match` block (never inside a `Match` block).
@@ -79,6 +116,22 @@ export function parseSshdConfig(content: string): ParsedSshdConfig {
 export function updateSshdConfig(content: string, update: SshdConfigUpdate): string {
   if (!Number.isInteger(update.port) || update.port < 1 || update.port > 65535) {
     throw new Error(`无效端口号: ${update.port}，有效范围为 1-65535`);
+  }
+  if (
+    update.clientAliveInterval !== undefined &&
+    (!Number.isInteger(update.clientAliveInterval) ||
+      update.clientAliveInterval < 0 ||
+      update.clientAliveInterval > 3600)
+  ) {
+    throw new Error(`无效 ClientAliveInterval: ${update.clientAliveInterval}，有效范围为 0-3600 秒`);
+  }
+  if (
+    update.clientAliveCountMax !== undefined &&
+    (!Number.isInteger(update.clientAliveCountMax) ||
+      update.clientAliveCountMax < 1 ||
+      update.clientAliveCountMax > 20)
+  ) {
+    throw new Error(`无效 ClientAliveCountMax: ${update.clientAliveCountMax}，有效范围为 1-20`);
   }
 
   const newline = content.includes('\r\n') ? '\r\n' : '\n';
@@ -117,6 +170,33 @@ export function updateSshdConfig(content: string, update: SshdConfigUpdate): str
       newLine: `PasswordAuthentication ${update.passwordAuthentication ? 'yes' : 'no'}`,
     },
   ];
+
+  if (update.tcpKeepAlive !== undefined) {
+    directives.push({
+      key: 'TCPKeepAlive',
+      activeRe: /^\s*TCPKeepAlive\s+\S+/i,
+      commentedRe: /^\s*#\s*TCPKeepAlive\s+\S+/i,
+      newLine: `TCPKeepAlive ${update.tcpKeepAlive ? 'yes' : 'no'}`,
+    });
+  }
+
+  if (update.clientAliveInterval !== undefined) {
+    directives.push({
+      key: 'ClientAliveInterval',
+      activeRe: /^\s*ClientAliveInterval\s+\S+/i,
+      commentedRe: /^\s*#\s*ClientAliveInterval\s+\S+/i,
+      newLine: `ClientAliveInterval ${update.clientAliveInterval}`,
+    });
+  }
+
+  if (update.clientAliveCountMax !== undefined) {
+    directives.push({
+      key: 'ClientAliveCountMax',
+      activeRe: /^\s*ClientAliveCountMax\s+\S+/i,
+      commentedRe: /^\s*#\s*ClientAliveCountMax\s+\S+/i,
+      newLine: `ClientAliveCountMax ${update.clientAliveCountMax}`,
+    });
+  }
 
   const missing: string[] = [];
 
