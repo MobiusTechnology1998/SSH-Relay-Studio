@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { formatSshCommandPreview } from '../../../shared/commandBuilders';
+import { computeNodeConfigHash, formatSshCommandPreview } from '../../../shared/commandBuilders';
 import type { AppSettings, NodeProfile, TunnelStatus } from '../../../shared/types';
 import { IconGlobe, IconPower, IconRefresh, IconShield } from '../../components/Icons';
 import { StatusBadge } from '../../components/StatusBadge';
@@ -162,6 +162,23 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
 
   const aliveInterval = activeNode?.serverAliveInterval ?? 15;
   const aliveCountMax = activeNode?.serverAliveCountMax ?? 3;
+  const configDrifted = Boolean(
+    isRunning &&
+      activeNode &&
+      tunnelStatus.runningConfigHash &&
+      computeNodeConfigHash(activeNode) !== tunnelStatus.runningConfigHash
+  );
+
+  const handleApplyDriftedConfig = async () => {
+    if (!activeNode) return;
+    setBusy(true);
+    try {
+      const res = await window.relayApi.startTunnel(activeNode.id);
+      onNotify(res.ok ? 'success' : 'error', res.ok ? `已按最新配置重连：${activeNode.name}` : res.message);
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
     <div className="stack-md">
@@ -255,6 +272,22 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Config Drift Banner */}
+      {configDrifted && activeNode && (
+        <div className="callout callout-warn row-between">
+          <div>
+            <strong>节点配置已变更：</strong>当前运行的隧道仍在使用旧配置，点击右侧按钮立即按最新设置重连生效。
+          </div>
+          <button
+            className="btn btn-sm btn-primary"
+            onClick={handleApplyDriftedConfig}
+            disabled={busy}
+          >
+            立即应用并重连
+          </button>
+        </div>
+      )}
 
       {/* Error & Actionable Hint */}
       {tunnelStatus.lastError && (

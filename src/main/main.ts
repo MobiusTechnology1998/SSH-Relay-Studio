@@ -30,6 +30,7 @@ import { runTunnelDiagnostics } from './clientA/diagnostics';
 import {
   generateEd25519KeyPair,
   getKeyPairInfo,
+  isHostKeyTrusted,
   runSecurityVerification,
   scanHostKeys,
   trustHostKeys,
@@ -397,6 +398,9 @@ function registerIpcHandlers(): void {
   ipcMain.handle('clientA:generateKeyPair', (_e, forceOverwrite = false) =>
     generateEd25519KeyPair(forceOverwrite)
   );
+  ipcMain.handle('clientA:isHostKeyTrusted', (_e, host: string, port: number) =>
+    isHostKeyTrusted(host, port)
+  );
   ipcMain.handle('clientA:scanHostKeys', (_e, host: string, port: number) =>
     scanHostKeys(host, port)
   );
@@ -437,7 +441,7 @@ function registerIpcHandlers(): void {
   );
 
   // ===== Server B =====
-  ipcMain.handle('serverB:getOverview', async (): Promise<ServerOverview> => {
+  ipcMain.handle('serverB:getOverview', async (_e, forceRefresh = false): Promise<ServerOverview> => {
     const settings = settingsStore.load();
     setCustomOpenSshDir(settings.customOpenSshDir);
     const config = readSshdConfigState();
@@ -461,7 +465,7 @@ function registerIpcHandlers(): void {
       getServerSystemTuning(),
       quicServerMgr.getStatus(settings.customHysteriaPath),
       inspectNetworkState(config.port),
-      detectServerPublicIp(),
+      detectServerPublicIp(Boolean(forceRefresh)),
     ]);
 
     return {

@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
+import { isPort22FirewallRule } from '../../../shared/commandBuilders';
 import type { ServerOverview } from '../../../shared/types';
 import { IconCheck } from '../../components/Icons';
 import { StatusBadge } from '../../components/StatusBadge';
@@ -22,6 +23,12 @@ export const ServerDeploy: React.FC<ServerDeployProps> = ({
   );
   const [verifiedOnA, setVerifiedOnA] = useState(false);
 
+  useEffect(() => {
+    if (overview?.config.port && overview.config.port !== 22) {
+      setTargetPort(overview.config.port);
+    }
+  }, [overview?.config.port]);
+
   const step1Done = Boolean(
     overview?.service.installed && overview.service.status === 'Running'
   );
@@ -37,11 +44,7 @@ export const ServerDeploy: React.FC<ServerDeployProps> = ({
       !overview.config.passwordAuthentication
   );
   const port22StillEnabled = Boolean(
-    overview?.firewallRules.some(
-      (r) =>
-        r.enabled &&
-        (r.localPort.split(',').includes('22') || r.displayName === 'OpenSSH Server (sshd)')
-    )
+    overview?.firewallRules.some((r) => isPort22FirewallRule(r))
   );
   const step4Done = step3Done && !port22StillEnabled;
   const step5Done = Boolean(
@@ -87,14 +90,12 @@ export const ServerDeploy: React.FC<ServerDeployProps> = ({
     }
     setBusyStep(3);
     try {
-      // 1. Allow new port in Windows Firewall FIRST so we never lock ourselves out
       const fwRes = await window.relayApi.allowFirewallPort(targetPort);
       if (!fwRes.ok) {
         onNotify('error', fwRes.message);
         return;
       }
 
-      // 2. Update sshd_config with sshd -t syntax check & automatic rollback
       const cfgRes = await window.relayApi.applySshdConfig({
         port: targetPort,
         pubkeyAuthentication: true,
@@ -112,7 +113,6 @@ export const ServerDeploy: React.FC<ServerDeployProps> = ({
         return;
       }
 
-      // 3. Restart sshd service
       const restartRes = await window.relayApi.controlSshdService('restart');
       onNotify(
         restartRes.ok ? 'success' : 'error',
@@ -160,6 +160,8 @@ export const ServerDeploy: React.FC<ServerDeployProps> = ({
     }
   };
 
+  const portChangedFromCurrent = Boolean(overview && targetPort !== overview.config.port);
+
   return (
     <div className="stack-md">
       <div className="page-header">
@@ -189,11 +191,15 @@ export const ServerDeploy: React.FC<ServerDeployProps> = ({
             <code className="mono">sshd</code> 服务并设为开机自动启动。
           </p>
           <button
-            className="btn btn-primary"
+            className={`btn ${step1Done ? '' : 'btn-primary'}`}
             onClick={handleInstallSsh}
-            disabled={busyStep !== null}
+            disabled={busyStep !== null || step1Done}
           >
-            {busyStep === 1 ? '正在安装并启动（可能需要 1~2 分钟）...' : '一键安装并启动 OpenSSH Server'}
+            {step1Done
+              ? '✓ 已安装并正在运行'
+              : busyStep === 1
+              ? '正在安装并启动（可能需要 1~2 分钟）...'
+              : '一键安装并启动 OpenSSH Server'}
           </button>
         </div>
       </div>
@@ -237,11 +243,15 @@ export const ServerDeploy: React.FC<ServerDeployProps> = ({
             />
             <div className="row-wrap">
               <button
-                className="btn btn-primary"
+                className={`btn ${step2Done ? '' : 'btn-primary'}`}
                 onClick={handleAddKey}
-                disabled={busyStep !== null}
+                disabled={busyStep !== null || !pubKeyInput.trim()}
               >
-                {busyStep === 2 ? '写入并收紧权限中...' : '追加公钥并自动执行 icacls'}
+                {busyStep === 2
+                  ? '写入并收紧权限中...'
+                  : step2Done
+                  ? '继续追加其他设备 A 公钥'
+                  : '追加公钥并自动执行 icacls'}
               </button>
             </div>
           </div>
@@ -276,11 +286,15 @@ export const ServerDeploy: React.FC<ServerDeployProps> = ({
               onChange={(e) => setTargetPort(Number(e.target.value) || 53622)}
             />
             <button
-              className="btn btn-primary"
+              className={`btn ${step3Done && !portChangedFromCurrent ? '' : 'btn-primary'}`}
               onClick={handleApplyHardening}
-              disabled={busyStep !== null || !step2Done}
+              disabled={busyStep !== null || !step2Done || (step3Done && !portChangedFromCurrent)}
             >
-              {busyStep === 3 ? '正在加固并校验...' : `一键加固至端口 ${targetPort} 并重启 sshd`}
+              {busyStep === 3
+                ? '正在加固并校验...'
+                : step3Done && !portChangedFromCurrent
+                ? `✓ 已加固至端口 ${overview?.config.port}`
+                : `一键加固至端口 ${targetPort} 并重启 sshd`}
             </button>
           </div>
 
@@ -308,25 +322,31 @@ export const ServerDeploy: React.FC<ServerDeployProps> = ({
           <p className="step-desc">
             务必先在设备 A 使用新端口 <code className="mono">{targetPort}</code> 完成指纹信任和免密登录校验后，再禁用旧 22 端口防火墙规则（精准禁用，绝不误删新端口规则），并同步删除云安全组中的 22 端口规则。
           </p>
-          <div className="stack-sm">
-            <label className="checkbox-row">
-              <input
-                type="checkbox"
-                checked={verifiedOnA}
-                onChange={(e) => setVerifiedOnA(e.target.checked)}
-              />
-              <span>我已在设备 A 确认新端口免密登录成功，且保留了云控制台/RDP 管理通道</span>
-            </label>
-            <div>
-              <button
-                className="btn"
-                onClick={handleCleanupPort22}
-                disabled={busyStep !== null || !verifiedOnA}
-              >
-                {busyStep === 4 ? '处理中...' : '精准禁用本机旧 22 端口防火墙规则'}
-              </button>
+          {step4Done ? (
+            <button className="btn" disabled>
+              ✓ 旧 22 端口规则已禁用
+            </button>
+          ) : (
+            <div className="stack-sm">
+              <label className="checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={verifiedOnA}
+                  onChange={(e) => setVerifiedOnA(e.target.checked)}
+                />
+                <span>我已在设备 A 确认新端口免密登录成功，且保留了云控制台/RDP 管理通道</span>
+              </label>
+              <div>
+                <button
+                  className="btn btn-primary"
+                  onClick={handleCleanupPort22}
+                  disabled={busyStep !== null || !verifiedOnA || !step3Done}
+                >
+                  {busyStep === 4 ? '处理中...' : '精准禁用本机旧 22 端口防火墙规则'}
+                </button>
+              </div>
             </div>
-          </div>
+          )}
         </div>
       </div>
 
@@ -347,11 +367,15 @@ export const ServerDeploy: React.FC<ServerDeployProps> = ({
             一键配置 <code className="mono">sc.exe failure sshd</code> 崩溃 5 秒拉起、禁用 Windows 更新强制重启、关闭电源休眠，并启用跨国弱网 TCP 调优（CUBIC/CTCP 拥塞控制、AutoTuning、Timestamps、禁用 ECN）。
           </p>
           <button
-            className="btn btn-primary"
+            className={`btn ${step5Done ? '' : 'btn-primary'}`}
             onClick={handleApplyStability}
-            disabled={busyStep !== null}
+            disabled={busyStep !== null || step5Done}
           >
-            {busyStep === 5 ? '正在应用策略...' : '一键应用长期稳定与弱网调优'}
+            {step5Done
+              ? '✓ 长期稳定与弱网调优已全部生效'
+              : busyStep === 5
+              ? '正在应用策略...'
+              : '一键应用长期稳定与弱网调优'}
           </button>
         </div>
       </div>

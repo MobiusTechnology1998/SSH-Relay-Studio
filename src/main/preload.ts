@@ -53,6 +53,7 @@ export interface RelayApi {
   // Client A: Keys, Host Trust & Security
   getKeyPairInfo: (customPath?: string) => Promise<KeyPairInfo>;
   generateKeyPair: (forceOverwrite?: boolean) => Promise<ActionResult<KeyPairInfo>>;
+  isHostKeyTrusted: (host: string, port: number) => Promise<boolean>;
   scanHostKeys: (host: string, port: number) => Promise<HostKeyScanResult>;
   trustHostKeys: (
     host: string,
@@ -76,7 +77,7 @@ export interface RelayApi {
   importHysteriaBinary: (scope: 'clientA' | 'serverB', filePath: string) => Promise<ActionResult<BinaryStatusInfo>>;
 
   // Server B: Overview, Service, Config, Keys, Firewall, Stability & QUIC
-  getServerOverview: () => Promise<ServerOverview>;
+  getServerOverview: (forceRefresh?: boolean) => Promise<ServerOverview>;
   installOpenSshServer: () => Promise<ActionResult>;
   controlSshdService: (action: 'start' | 'stop' | 'restart') => Promise<ActionResult>;
   configureSshdFailureRecovery: () => Promise<ActionResult>;
@@ -130,6 +131,7 @@ const api: RelayApi = {
 
   getKeyPairInfo: (customPath) => ipcRenderer.invoke('clientA:getKeyPairInfo', customPath),
   generateKeyPair: (forceOverwrite) => ipcRenderer.invoke('clientA:generateKeyPair', forceOverwrite),
+  isHostKeyTrusted: (host, port) => ipcRenderer.invoke('clientA:isHostKeyTrusted', host, port),
   scanHostKeys: (host, port) => ipcRenderer.invoke('clientA:scanHostKeys', host, port),
   trustHostKeys: (host, port, entries) =>
     ipcRenderer.invoke('clientA:trustHostKeys', host, port, entries),
@@ -144,7 +146,8 @@ const api: RelayApi = {
   importHysteriaBinary: (scope, filePath) =>
     ipcRenderer.invoke('engine:importHysteria', scope, filePath),
 
-  getServerOverview: () => ipcRenderer.invoke('serverB:getOverview'),
+  getServerOverview: (forceRefresh = false) =>
+    ipcRenderer.invoke('serverB:getOverview', forceRefresh),
   installOpenSshServer: () => ipcRenderer.invoke('serverB:installOpenSsh'),
   controlSshdService: (action) => ipcRenderer.invoke('serverB:controlSshd', action),
   configureSshdFailureRecovery: () => ipcRenderer.invoke('serverB:configureFailureRecovery'),

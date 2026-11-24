@@ -96,15 +96,26 @@ export async function inspectNetworkState(sshPort: number): Promise<{
   };
 }
 
-export async function detectServerPublicIp(): Promise<string | null> {
+let cachedPublicIp: string | null = null;
+let cachedPublicIpAt = 0;
+const PUBLIC_IP_CACHE_TTL_MS = 5 * 60 * 1000;
+
+export async function detectServerPublicIp(forceRefresh = false): Promise<string | null> {
+  if (!forceRefresh && cachedPublicIpAt > 0 && Date.now() - cachedPublicIpAt < PUBLIC_IP_CACHE_TTL_MS) {
+    return cachedPublicIp;
+  }
+
   const curlBin = IS_WINDOWS ? 'curl.exe' : 'curl';
   const urls = ['https://api.ipify.org', 'https://ifconfig.me/ip'];
   for (const url of urls) {
-    const res = await execCmd(curlBin, ['-sS', '--max-time', '5', url], { timeoutMs: 6500 });
+    const res = await execCmd(curlBin, ['-sS', '--max-time', '4', url], { timeoutMs: 5000 });
     const candidate = res.stdout.trim();
     if (res.code === 0 && /^[0-9]{1,3}(\.[0-9]{1,3}){3}$/.test(candidate)) {
+      cachedPublicIp = candidate;
+      cachedPublicIpAt = Date.now();
       return candidate;
     }
   }
-  return null;
+  cachedPublicIpAt = Date.now();
+  return cachedPublicIp;
 }

@@ -263,13 +263,36 @@ export const ServerHardening: React.FC<ServerHardeningProps> = ({
     }
   };
 
+  const isSshdDirty = Boolean(
+    !overview ||
+      port !== overview.config.port ||
+      pubkeyAuth !== overview.config.pubkeyAuthentication ||
+      passwordAuth !== overview.config.passwordAuthentication ||
+      tcpKeepAlive !== overview.config.tcpKeepAlive ||
+      clientAliveInterval !== overview.config.clientAliveInterval ||
+      clientAliveCountMax !== overview.config.clientAliveCountMax ||
+      useDns !== overview.config.useDns ||
+      (disableCompression ? 'no' : 'delayed') !== overview.config.compression ||
+      maxSessions !== overview.config.maxSessions ||
+      maxStartups.trim() !== overview.config.maxStartups
+  );
+
+  const isQuicDirty = Boolean(
+    !overview?.quicServer.configured ||
+      quicUdpPort !== overview.quicServer.udpPort ||
+      quicSni.trim() !== overview.quicServer.sni ||
+      quicMaxUpMbps !== overview.quicServer.maxUpMbps ||
+      quicMaxDownMbps !== overview.quicServer.maxDownMbps ||
+      quicEnableObfs !== Boolean(overview.quicServer.obfsPassword)
+  );
+
   return (
     <div className="stack-md">
       <div className="page-header">
         <div>
           <h1 className="page-title">安全加固、防火墙与长期稳定性</h1>
           <p className="page-desc">
-            精细化管理 <code className="mono">sshd_config</code>、Windows 防火墙规则、服务异常拉起与 Windows 更新防重启策略
+            精细化管理 <code className="mono">sshd_config</code>、Windows 防火墙规则、服务异常拉起、TCP 弱网调优与 QUIC 服务端
           </p>
         </div>
       </div>
@@ -415,19 +438,21 @@ export const ServerHardening: React.FC<ServerHardeningProps> = ({
 
         <div className="row-wrap" style={{ marginTop: 4 }}>
           <button
-            className="btn btn-primary"
+            className={`btn ${isSshdDirty ? 'btn-primary' : ''}`}
             onClick={() => handleSaveSshdConfig(true)}
-            disabled={busy}
+            disabled={busy || !isSshdDirty}
           >
-            校验保存并重启 sshd
+            {isSshdDirty ? '校验保存并重启 sshd' : '✓ 当前 sshd_config 已是最新'}
           </button>
-          <button
-            className="btn"
-            onClick={() => handleSaveSshdConfig(false)}
-            disabled={busy}
-          >
-            仅校验并保存（稍后重启）
-          </button>
+          {isSshdDirty && (
+            <button
+              className="btn"
+              onClick={() => handleSaveSshdConfig(false)}
+              disabled={busy}
+            >
+              仅校验并保存（稍后重启）
+            </button>
+          )}
         </div>
       </div>
 
@@ -437,7 +462,7 @@ export const ServerHardening: React.FC<ServerHardeningProps> = ({
           <div>
             <h3 className="card-title">
               <IconShield size={16} />
-              Windows 防火墙 SSH 入站规则
+              Windows 防火墙 SSH / QUIC 入站规则
             </h3>
             <p className="card-subtitle">
               独立命名规则放行高位端口，禁用 22 端口时绝不误删自定义端口规则
@@ -492,7 +517,7 @@ export const ServerHardening: React.FC<ServerHardeningProps> = ({
             </table>
           </div>
         ) : (
-          <div className="callout">未检测到 OpenSSH 相关入站防火墙规则。</div>
+          <div className="callout">未检测到 OpenSSH / QUIC 相关入站防火墙规则。</div>
         )}
       </div>
 
@@ -511,8 +536,12 @@ export const ServerHardening: React.FC<ServerHardeningProps> = ({
               '设置服务开机自启，并在异常崩溃时 5 秒后自动重启（sc.exe failure sshd）。'}
           </p>
           <div>
-            <button className="btn btn-primary" onClick={handleFailureRecovery} disabled={busy}>
-              配置 5 秒崩溃自愈
+            <button
+              className={`btn ${overview?.service.failureRecoveryConfigured ? '' : 'btn-primary'}`}
+              onClick={handleFailureRecovery}
+              disabled={busy || Boolean(overview?.service.failureRecoveryConfigured)}
+            >
+              {overview?.service.failureRecoveryConfigured ? '✓ 已启用 5 秒崩溃自愈' : '配置 5 秒崩溃自愈'}
             </button>
           </div>
         </div>
@@ -535,15 +564,15 @@ export const ServerHardening: React.FC<ServerHardeningProps> = ({
           </p>
           <div className="row-wrap">
             <button
-              className="btn btn-primary"
+              className={`btn ${overview?.updatePolicy.autoRebootDisabled ? '' : 'btn-primary'}`}
               onClick={() => handleToggleAutoReboot(true)}
-              disabled={busy}
+              disabled={busy || Boolean(overview?.updatePolicy.autoRebootDisabled)}
             >
-              禁止自动重启
+              {overview?.updatePolicy.autoRebootDisabled ? '✓ 已禁止自动重启' : '禁止自动重启'}
             </button>
             {overview?.updatePolicy.autoRebootDisabled && (
               <button
-                className="btn"
+                className="btn btn-ghost btn-sm"
                 onClick={() => handleToggleAutoReboot(false)}
                 disabled={busy}
               >
@@ -575,7 +604,11 @@ export const ServerHardening: React.FC<ServerHardeningProps> = ({
             <div className="metric-value" style={{ fontSize: 15 }}>
               {overview?.systemTuning.sleepDisabled ? '永不休眠' : '系统默认'}
             </div>
-            <div className="metric-sub">AC 休眠超时 = 0</div>
+            <div className="metric-sub">
+              {overview?.systemTuning.standbyTimeoutAcSec === null
+                ? '云主机无休眠项'
+                : 'AC 休眠超时 = 0'}
+            </div>
           </div>
           <div className="metric-tile">
             <div className="metric-label">拥塞控制算法</div>
@@ -602,8 +635,12 @@ export const ServerHardening: React.FC<ServerHardeningProps> = ({
         </div>
 
         <div>
-          <button className="btn btn-primary" onClick={handleApplySystemTuning} disabled={busy}>
-            一键应用跨国弱网 TCP 与防休眠调优
+          <button
+            className={`btn ${overview?.systemTuning.tuned ? '' : 'btn-primary'}`}
+            onClick={handleApplySystemTuning}
+            disabled={busy || Boolean(overview?.systemTuning.tuned)}
+          >
+            {overview?.systemTuning.tuned ? '✓ 跨国弱网 TCP 与防休眠已调优' : '一键应用跨国弱网 TCP 与防休眠调优'}
           </button>
         </div>
       </div>
@@ -636,23 +673,29 @@ export const ServerHardening: React.FC<ServerHardeningProps> = ({
         </div>
 
         <div className="row-wrap">
-          <button
-            className="btn btn-sm"
-            onClick={handleDownloadQuicServer}
-            disabled={busy}
-          >
-            一键下载 Hysteria 2
-          </button>
+          {overview?.quicServer.binaryInstalled ? (
+            <button className="btn btn-sm" disabled>
+              ✓ 已安装 ({overview.quicServer.binaryVersion ?? 'v2'})
+            </button>
+          ) : (
+            <button
+              className="btn btn-sm btn-primary"
+              onClick={handleDownloadQuicServer}
+              disabled={busy}
+            >
+              一键下载 Hysteria 2
+            </button>
+          )}
           <button
             className="btn btn-sm"
             onClick={handleImportQuicServer}
             disabled={busy}
           >
-            导入本地 hysteria.exe
+            {overview?.quicServer.binaryInstalled ? '替换本地文件' : '导入本地 hysteria.exe'}
           </button>
           <span className="mono" style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
             {overview?.quicServer.binaryInstalled
-              ? `${overview.quicServer.binaryVersion ?? 'v2'} · ${overview.quicServer.binaryPath}`
+              ? overview.quicServer.binaryPath
               : '尚未安装 hysteria.exe（单文件约 15MB）'}
           </span>
         </div>
@@ -730,12 +773,18 @@ export const ServerHardening: React.FC<ServerHardeningProps> = ({
 
         <div className="row-wrap">
           <button
-            className="btn btn-primary"
+            className={`btn ${!overview?.quicServer.running || isQuicDirty ? 'btn-primary' : ''}`}
             onClick={handleDeployQuicServer}
-            disabled={busy || !overview?.quicServer.binaryInstalled}
+            disabled={
+              busy ||
+              !overview?.quicServer.binaryInstalled ||
+              (Boolean(overview?.quicServer.running) && !isQuicDirty)
+            }
           >
-            {overview?.quicServer.running
-              ? '重新生成配置并重启 QUIC'
+            {overview?.quicServer.running && !isQuicDirty
+              ? `✓ QUIC 服务运行中 (UDP :${overview.quicServer.udpPort})`
+              : overview?.quicServer.running
+              ? '保存修改并重启 QUIC'
               : '一键生成证书、放行 UDP 并启动 QUIC'}
           </button>
           {overview?.quicServer.running && (
@@ -744,8 +793,14 @@ export const ServerHardening: React.FC<ServerHardeningProps> = ({
             </button>
           )}
           {overview?.quicServer.configured && (
-            <button className="btn" onClick={handleConfigureQuicTask} disabled={busy}>
-              配置开机自启与崩溃自愈
+            <button
+              className="btn"
+              onClick={handleConfigureQuicTask}
+              disabled={busy || Boolean(overview?.quicServer.startupTaskConfigured)}
+            >
+              {overview?.quicServer.startupTaskConfigured
+                ? '✓ 已配置开机自启任务'
+                : '配置开机自启与崩溃自愈'}
             </button>
           )}
         </div>

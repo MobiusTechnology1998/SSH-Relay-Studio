@@ -19,6 +19,7 @@ export const ClientKeysPairing: React.FC<ClientKeysPairingProps> = ({
   onNotify,
 }) => {
   const [keyInfo, setKeyInfo] = useState<KeyPairInfo | null>(null);
+  const [hostTrusted, setHostTrusted] = useState(false);
   const [busy, setBusy] = useState(false);
   const [scanResult, setScanResult] = useState<HostKeyScanResult | null>(null);
   const [trustModalOpen, setTrustModalOpen] = useState(false);
@@ -29,9 +30,22 @@ export const ClientKeysPairing: React.FC<ClientKeysPairingProps> = ({
     setKeyInfo(info);
   };
 
+  const loadHostTrust = async () => {
+    if (!activeNode?.host.trim()) {
+      setHostTrusted(false);
+      return;
+    }
+    const trusted = await window.relayApi.isHostKeyTrusted(activeNode.host, activeNode.sshPort);
+    setHostTrusted(trusted);
+  };
+
   useEffect(() => {
     loadKeyInfo();
   }, [activeNode?.privateKeyPath]);
+
+  useEffect(() => {
+    loadHostTrust();
+  }, [activeNode?.host, activeNode?.sshPort]);
 
   const handleGenerateKey = async (force = false) => {
     setBusy(true);
@@ -59,6 +73,9 @@ export const ClientKeysPairing: React.FC<ClientKeysPairingProps> = ({
     try {
       const res = await window.relayApi.scanHostKeys(activeNode.host, activeNode.sshPort);
       setScanResult(res);
+      if (res.success && res.alreadyTrusted) {
+        setHostTrusted(true);
+      }
       if (!res.success) {
         onNotify('error', res.error || '扫描主机指纹失败');
       } else {
@@ -77,6 +94,10 @@ export const ClientKeysPairing: React.FC<ClientKeysPairingProps> = ({
       scanResult.entries.map((e) => ({ keyType: e.keyType, keyData: e.keyData }))
     );
     setTrustModalOpen(false);
+    if (res.ok) {
+      setHostTrusted(true);
+      setScanResult({ ...scanResult, alreadyTrusted: true });
+    }
     onNotify(res.ok ? 'success' : 'error', res.message);
   };
 
@@ -177,15 +198,20 @@ export const ClientKeysPairing: React.FC<ClientKeysPairingProps> = ({
 
       {/* Step 2: Host Key Fingerprint Trust */}
       <div className="step-item">
-        <div className={`step-num ${scanResult?.alreadyTrusted ? 'done' : 'active'}`}>2</div>
+        <div className={`step-num ${hostTrusted ? 'done' : 'active'}`}>
+          {hostTrusted ? <IconCheck size={14} /> : '2'}
+        </div>
         <div className="step-body">
           <div className="step-title">
             信任设备 B 主机指纹（避免更换高位端口后静默拒连）
             {activeNode && (
               <StatusBadge
-                variant="neutral"
-                dot={false}
-                label={`${activeNode.host}:${activeNode.sshPort}`}
+                variant={hostTrusted ? 'success' : 'warn'}
+                label={
+                  hostTrusted
+                    ? `已信任 ${activeNode.host}:${activeNode.sshPort}`
+                    : `待信任 ${activeNode.host}:${activeNode.sshPort}`
+                }
               />
             )}
           </div>
@@ -194,13 +220,28 @@ export const ClientKeysPairing: React.FC<ClientKeysPairingProps> = ({
             <code className="mono">known_hosts</code>，后台守护进程（<code className="mono">BatchMode=yes</code>）会直接拒连。若你使用了设备 B 的配对码导入，则已自动完成信任。
           </p>
           <div className="row-wrap">
-            <button
-              className="btn btn-primary"
-              onClick={handleScanHostKey}
-              disabled={busy || !activeNode}
-            >
-              扫描并信任设备 B 主机指纹
-            </button>
+            {hostTrusted ? (
+              <>
+                <button className="btn" disabled>
+                  ✓ 主机指纹已信任
+                </button>
+                <button
+                  className="btn btn-ghost btn-sm"
+                  onClick={handleScanHostKey}
+                  disabled={busy || !activeNode}
+                >
+                  重新扫描更新
+                </button>
+              </>
+            ) : (
+              <button
+                className="btn btn-primary"
+                onClick={handleScanHostKey}
+                disabled={busy || !activeNode}
+              >
+                {busy ? '扫描中...' : '扫描并信任设备 B 主机指纹'}
+              </button>
+            )}
           </div>
         </div>
       </div>

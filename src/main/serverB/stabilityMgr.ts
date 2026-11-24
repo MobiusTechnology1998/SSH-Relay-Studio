@@ -115,18 +115,25 @@ export async function getServerSystemTuning(): Promise<ServerSystemTuningState> 
   const psScript = `
     $tcp = Get-NetTCPSetting -SettingName Internet -ErrorAction SilentlyContinue | Select-Object -First 1
     $acSec = $null
+    $sleepSupported = $true
     try {
       $pwrOut = powercfg /q SCHEME_CURRENT SUB_SLEEP STANDBYIDLE 2>$null
-      $hexMatches = [regex]::Matches(($pwrOut -join "\`n"), '0x([0-9a-fA-F]{8})')
+      $joined = ($pwrOut -join "\`n")
+      $hexMatches = [regex]::Matches($joined, '0x([0-9a-fA-F]{8})')
       if ($hexMatches.Count -ge 2) {
-        # The last two 8-digit hex values in STANDBYIDLE output are AC index then DC index
         $acHex = $hexMatches[$hexMatches.Count - 2].Groups[1].Value
         $acSec = [Convert]::ToInt32($acHex, 16)
+      } else {
+        # Cloud VMs / Servers without ACPI S3 sleep do not expose STANDBYIDLE
+        $sleepSupported = $false
       }
-    } catch {}
+    } catch {
+      $sleepSupported = $false
+    }
 
     [PSCustomObject]@{
       standbyTimeoutAcSec = $acSec
+      sleepSupported = $sleepSupported
       tcpAutoTuning = if ($tcp) { [string]$tcp.AutoTuningLevelLocal } else { 'Unknown' }
       tcpCongestionProvider = if ($tcp) { [string]$tcp.CongestionProvider } else { 'Unknown' }
       tcpEcnCapability = if ($tcp) { [string]$tcp.EcnCapability } else { 'Unknown' }
@@ -139,15 +146,16 @@ export async function getServerSystemTuning(): Promise<ServerSystemTuningState> 
     const parsed = JSON.parse(res.stdout.trim() || '{}');
     const standbyTimeoutAcSec =
       typeof parsed.standbyTimeoutAcSec === 'number' ? parsed.standbyTimeoutAcSec : null;
-    const sleepDisabled = standbyTimeoutAcSec === 0;
+    // Cloud VMs without sleep support (sleepSupported === false) cannot sleep, so sleep is effectively disabled
+    const sleepDisabled = standbyTimeoutAcSec === 0 || parsed.sleepSupported === false;
     const tcpAutoTuning = String(parsed.tcpAutoTuning || 'Unknown');
     const tcpCongestionProvider = String(parsed.tcpCongestionProvider || 'Unknown');
     const tcpEcnCapability = String(parsed.tcpEcnCapability || 'Unknown');
     const tcpTimestamps = String(parsed.tcpTimestamps || 'Unknown');
 
-    const congestionOk = /^(cubic|ctcp)$/i.test(tcpCongestionProvider);
     const autoTuneOk = /^normal$/i.test(tcpAutoTuning);
     const timestampsOk = /^enabled$/i.test(tcpTimestamps);
+    const ecnOk = /^disabled$/i.test(tcpEcnCapability);
 
     return {
       sleepDisabled,
@@ -156,7 +164,7 @@ export async function getServerSystemTuning(): Promise<ServerSystemTuningState> 
       tcpCongestionProvider,
       tcpEcnCapability,
       tcpTimestamps,
-      tuned: sleepDisabled && congestionOk && autoTuneOk && timestampsOk,
+      tuned: sleepDisabled && autoTuneOk && timestampsOk && ecnOk,
     };
   } catch {
     return {
@@ -175,8 +183,9 @@ export async function getServerSystemTuning(): Promise<ServerSystemTuningState> 
  * Tunes Windows Device B for cross-border high-RTT weak-network relay stability & throughput:
  * - Disables AC sleep & hibernate so relay never suspends
  * - Disables physical NIC power-off saving (best effort)
- * - Enables TCP Receive Window Auto-Tuning (Normal), CUBIC (fallback CTCP) congestion control,
- *   TCP Timestamps (for accurate cross-border RTT/PAWS), and disables ECN (avoids middlebox drops).
+ * - Enables TCP Receive Window Auto-Tuning (Normal), CUBIC (fallback CTCP) via `netsh int tcp set supplemental`
+ *   (because `Set-NetTCPSetting -SettingName Internet -CongestionProvider` is read-only on Windows Server/Win10+),
+ *   enables TCP Timestamps, and disables ECN.
  */
 export async function applyServerSystemTuning(): Promise<ActionResult<ServerSystemTuningState>> {
   if (!IS_WINDOWS) {
@@ -184,45 +193,47 @@ export async function applyServerSystemTuning(): Promise<ActionResult<ServerSyst
   }
 
   const psScript = `
-    $ErrorActionPreference = 'Stop'
-    powercfg -change -standby-timeout-ac 0 | Out-Null
-    powercfg -change -hibernate-timeout-ac 0 | Out-Null
+    $ErrorActionPreference = 'Continue'
+    powercfg -change -standby-timeout-ac 0 2>$null | Out-Null
+    powercfg -change -hibernate-timeout-ac 0 2>$null | Out-Null
 
-    # Disable physical NIC sleep saving where supported (cloud vNICs may not support this, ignore errors)
     try {
       Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | ForEach-Object {
         Disable-NetAdapterPowerManagement -Name $_.Name -ErrorAction SilentlyContinue | Out-Null
       }
     } catch {}
 
-    # Tune Internet TCP template for cross-border high-RTT & packet loss
-    Set-NetTCPSetting -SettingName Internet -AutoTuningLevelLocal Normal -EcnCapability Disabled -Timestamps Enabled -ErrorAction Stop | Out-Null
-
-    # Prefer CUBIC (best for cross-border high-RTT weak networks), fallback to CTCP on older Server versions
+    # Set global TCP window auto-tuning, timestamps, and disable ECN
+    netsh int tcp set global autotuninglevel=normal ecncapability=disabled timestamps=enabled 2>$null | Out-Null
     try {
-      Set-NetTCPSetting -SettingName Internet -CongestionProvider CUBIC -ErrorAction Stop | Out-Null
-    } catch {
-      try {
-        Set-NetTCPSetting -SettingName Internet -CongestionProvider CTCP -ErrorAction Stop | Out-Null
-      } catch {}
+      Set-NetTCPSetting -SettingName Internet -AutoTuningLevelLocal Normal -EcnCapability Disabled -Timestamps Enabled -ErrorAction SilentlyContinue | Out-Null
+    } catch {}
+
+    # Official way to switch Internet template CongestionProvider on Windows 10/11 & Server 2019/2022
+    $cubicRes = netsh int tcp set supplemental template=internet congestionprovider=cubic 2>&1
+    if ($LASTEXITCODE -ne 0) {
+      netsh int tcp set supplemental template=internet congestionprovider=ctcp 2>$null | Out-Null
     }
   `;
 
   const res = await runPowerShell(psScript, 25000);
-  if (res.code !== 0) {
+  const next = await getServerSystemTuning();
+
+  if (res.code !== 0 && !next.tuned) {
     const msg = `应用系统网络与电源调优失败（请确认已以管理员身份运行）: ${res.stderr.trim() || res.stdout.trim()}`;
     logger.error('serverB', msg);
-    return { ok: false, message: msg };
+    return { ok: false, message: msg, data: next };
   }
 
-  const next = await getServerSystemTuning();
   logger.success(
     'serverB',
-    `已完成设备 B 跨国弱网系统调优: 防休眠=${next.sleepDisabled ? '已关闭休眠' : '未知'}, 拥塞控制=${next.tcpCongestionProvider}, AutoTuning=${next.tcpAutoTuning}, Timestamps=${next.tcpTimestamps}, ECN=${next.tcpEcnCapability}`
+    `已完成设备 B 跨国弱网系统调优: 防休眠=${next.sleepDisabled ? '已生效' : '未生效'}, 拥塞控制=${next.tcpCongestionProvider}, AutoTuning=${next.tcpAutoTuning}, Timestamps=${next.tcpTimestamps}, ECN=${next.tcpEcnCapability}`
   );
   return {
     ok: true,
-    message: `已完成弱网系统调优（拥塞控制: ${next.tcpCongestionProvider}，接收窗口: ${next.tcpAutoTuning}，已禁止系统休眠）`,
+    message: next.tuned
+      ? `弱网系统调优已生效（拥塞控制: ${next.tcpCongestionProvider}，窗口: ${next.tcpAutoTuning}，防休眠已开启）`
+      : `已执行调优命令，当前状态：拥塞控制=${next.tcpCongestionProvider}、窗口=${next.tcpAutoTuning}、Timestamps=${next.tcpTimestamps}`,
     data: next,
   };
 }

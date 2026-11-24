@@ -106,6 +106,7 @@ export interface TunnelStatus {
   totalBytesUp: number;
   totalBytesDown: number;
   workers: TunnelWorkerSummary[];
+  runningConfigHash?: string | null;
   lastError: string | null;
   diagnosticHint: string | null;
 }

@@ -180,11 +180,11 @@ export const ServerKeys: React.FC<ServerKeysProps> = ({
               label={authState?.permissionsValid ? 'ACL 合规' : '需收紧权限'}
             />
             <button
-              className="btn btn-primary btn-sm"
+              className={`btn btn-sm ${authState?.permissionsValid ? '' : 'btn-primary'}`}
               onClick={handleTightenAcl}
-              disabled={busy || !authState?.exists}
+              disabled={busy || !authState?.exists || Boolean(authState?.permissionsValid)}
             >
-              一键执行 icacls 收紧权限
+              {authState?.permissionsValid ? '✓ ACL 已合规' : '一键执行 icacls 收紧权限'}
             </button>
           </div>
         </div>

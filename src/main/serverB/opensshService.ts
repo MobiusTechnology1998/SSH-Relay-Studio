@@ -2,6 +2,13 @@ import type { ActionResult, OpenSshServiceStatus } from '../../shared/types';
 import { logger } from '../logger';
 import { detectOpenSshVersion, execCmd, IS_WINDOWS, runPowerShell } from '../platform/shell';
 
+/**
+ * Pure parser for `sc.exe qfailure sshd` supporting both English (`RESTART`) and Chinese (`重新启动`) Windows.
+ */
+export function parseScQfailureOutput(output: string): boolean {
+  return /(RESTART|重新启动|重啟|NEUSTART|RED[EÉ]MARRER)/i.test(output) && /\b5000\b/.test(output);
+}
+
 export async function getOpenSshServiceStatus(): Promise<OpenSshServiceStatus> {
   if (!IS_WINDOWS) {
     return {
@@ -19,12 +26,25 @@ export async function getOpenSshServiceStatus(): Promise<OpenSshServiceStatus> {
   const psScript = `
     $svc = Get-Service -Name sshd -ErrorAction SilentlyContinue
     $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' -ErrorAction SilentlyContinue | Select-Object -First 1
+    $regFailureOk = $false
+    try {
+      $fa = (Get-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\sshd' -Name 'FailureActions' -ErrorAction SilentlyContinue).FailureActions
+      # SERVICE_FAILURE_ACTIONS binary layout: 20-byte header, then { uint32 Type (1=RESTART), uint32 DelayMs } entries
+      if ($fa -and $fa.Length -ge 28) {
+        $actionType = [BitConverter]::ToUInt32($fa, 20)
+        $delayMs = [BitConverter]::ToUInt32($fa, 24)
+        if ($actionType -eq 1 -and $delayMs -gt 0 -and $delayMs -le 60000) {
+          $regFailureOk = $true
+        }
+      }
+    } catch {}
     $obj = [PSCustomObject]@{
       serviceExists = [bool]($null -ne $svc)
       status = if ($svc) { $svc.Status.ToString() } else { 'NotInstalled' }
       startType = if ($svc) { $svc.StartType.ToString() } else { 'Unknown' }
       installed = if ($cap) { $cap.State -eq 'Installed' } else { [bool]($null -ne $svc) }
       capabilityName = if ($cap) { $cap.Name } else { 'OpenSSH.Server~~~~0.0.1.0' }
+      regFailureOk = $regFailureOk
     }
     $obj | ConvertTo-Json -Compress
   `;
@@ -39,6 +59,7 @@ export async function getOpenSshServiceStatus(): Promise<OpenSshServiceStatus> {
     startType?: string;
     installed?: boolean;
     capabilityName?: string;
+    regFailureOk?: boolean;
   } = {};
 
   try {
@@ -49,13 +70,15 @@ export async function getOpenSshServiceStatus(): Promise<OpenSshServiceStatus> {
     logger.warn('serverB', `解析 OpenSSH 服务状态输出失败: ${res.stdout}`);
   }
 
-  // Query sc.exe qfailure sshd for 5000ms restart recovery check
-  let failureRecoveryConfigured = false;
-  let failureRecoveryDetail = '未配置崩溃自动重启';
-  if (parsed.serviceExists) {
+  // Locale-independent check: prefer Windows registry FailureActions binary, fallback to sc.exe qfailure
+  let failureRecoveryConfigured = Boolean(parsed.regFailureOk);
+  let failureRecoveryDetail = failureRecoveryConfigured
+    ? '已配置（异常退出 5 秒自动拉起，重置周期 86400 秒）'
+    : '未配置崩溃自动重启';
+  if (parsed.serviceExists && !failureRecoveryConfigured) {
     const qf = await execCmd('sc.exe', ['qfailure', 'sshd'], { timeoutMs: 8000 });
     const out = `${qf.stdout}\n${qf.stderr}`;
-    const hasRestart = /RESTART/i.test(out) && /5000/.test(out);
+    const hasRestart = parseScQfailureOutput(out);
     failureRecoveryConfigured = hasRestart;
     failureRecoveryDetail = hasRestart
       ? '已配置（异常退出 5 秒自动拉起，重置周期 86400 秒）'

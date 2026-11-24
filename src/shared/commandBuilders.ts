@@ -315,3 +315,59 @@ export function formatKnownHostsTarget(host: string, port: number): string {
   const cleanHost = host.trim();
   return port === 22 ? cleanHost : `[${cleanHost}]:${port}`;
 }
+
+/**
+ * Computes a deterministic fingerprint of all connection-affecting fields of a NodeProfile
+ * so the UI can reliably detect when a running tunnel's settings have drifted.
+ */
+export function computeNodeConfigHash(node: NodeProfile): string {
+  return JSON.stringify([
+    node.id,
+    node.host.trim(),
+    node.sshPort,
+    node.username.trim(),
+    node.mode,
+    node.localPort,
+    node.remoteProxyPort,
+    node.privateKeyPath.trim(),
+    Boolean(node.compression),
+    node.serverAliveInterval ?? 15,
+    node.serverAliveCountMax ?? 3,
+    node.forceIpv4 !== false,
+    node.preferFastCipher !== false,
+    node.healthCheckEnabled !== false,
+    node.healthCheckIntervalSec ?? 25,
+    node.poolSize ?? 3,
+    node.rotationIntervalMin ?? 0,
+    node.engine ?? 'openssh',
+    node.autoFallbackToSsh !== false,
+    node.quicUdpPort ?? 53623,
+    node.quicAuthToken ?? '',
+    node.quicCertPinSha256 ?? '',
+    node.quicSni ?? 'www.bing.com',
+    node.quicObfsPassword ?? '',
+    node.quicUpMbps ?? 50,
+    node.quicDownMbps ?? 200,
+  ]);
+}
+
+/**
+ * Accurately matches an enabled Windows Firewall inbound rule for port 22,
+ * regardless of whether `localPort` is formatted as `"22"`, `"TCP 22"`, or `"TCP 22,2222"`.
+ */
+export function isPort22FirewallRule(rule: {
+  name: string;
+  displayName: string;
+  enabled: boolean;
+  localPort: string;
+}): boolean {
+  if (!rule.enabled) return false;
+  if (rule.name === 'OpenSSH-Server-In-TCP' || rule.displayName === 'OpenSSH Server (sshd)') {
+    return true;
+  }
+  const tokens = rule.localPort
+    .replace(/^(TCP|UDP)\s+/i, '')
+    .split(/[,\s]+/)
+    .map((t) => t.trim());
+  return tokens.includes('22');
+}

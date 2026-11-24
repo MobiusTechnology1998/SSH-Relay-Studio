@@ -3,6 +3,7 @@ import os from 'os';
 import path from 'path';
 import {
   buildSshTunnelArgs,
+  computeNodeConfigHash,
   computeReconnectDelayMs,
   decodeSshOutputChunk,
   diagnoseSshError,
@@ -342,18 +343,22 @@ class TunnelManager {
     }
 
     this.activeNode = { ...node };
+    const configHash = computeNodeConfigHash(node);
 
     if (node.engine === 'hysteria2') {
       this.runningQuicMode = true;
       this.desiredRunning = true;
       const res = await this.quicEngine.start(node, this.customHysteriaPath);
-      if (!res.ok) {
+      if (res.ok) {
+        this.emit({ runningConfigHash: configHash });
+      } else {
         this.runningQuicMode = false;
         this.desiredRunning = false;
         this.emit({
           state: 'error',
           activeEngine: 'hysteria2',
           fallbackActive: false,
+          runningConfigHash: null,
           lastError: res.message,
           diagnosticHint: '可在「代理浏览器与工具」下载或导入 hysteria.exe，或将节点引擎切回 OpenSSH 多隧道。',
         });
@@ -369,6 +374,7 @@ class TunnelManager {
     isFallback: boolean
   ): Promise<ActionResult<TunnelStatus>> {
     this.runningQuicMode = false;
+    const configHash = computeNodeConfigHash(node);
 
     try {
       await this.balancer.start(node.localPort);
@@ -383,6 +389,7 @@ class TunnelManager {
         activeEngine: 'openssh',
         fallbackActive: isFallback,
         localPort: node.localPort,
+        runningConfigHash: null,
         lastError: msg,
         diagnosticHint: '请确认本地端口未被占用，或更换本地代理端口（如 1081）。',
       });
@@ -416,6 +423,7 @@ class TunnelManager {
       totalBytesUp: 0,
       totalBytesDown: 0,
       workers: [],
+      runningConfigHash: configHash,
       lastError: null,
       diagnosticHint: null,
     });
@@ -1074,6 +1082,7 @@ class TunnelManager {
       totalBytesUp: 0,
       totalBytesDown: 0,
       workers: [],
+      runningConfigHash: null,
       lastError: null,
       diagnosticHint: null,
     });

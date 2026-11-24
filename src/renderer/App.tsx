@@ -86,10 +86,10 @@ export const App: React.FC = () => {
     setEnvInfo(env);
   }, []);
 
-  const refreshServerOverview = useCallback(async () => {
+  const refreshServerOverview = useCallback(async (forceRefresh = false) => {
     setServerLoading(true);
     try {
-      const data = await window.relayApi.getServerOverview();
+      const data = await window.relayApi.getServerOverview(forceRefresh);
       setServerOverview(data);
     } finally {
       setServerLoading(false);
@@ -237,7 +237,12 @@ export const App: React.FC = () => {
               key={item.id}
               type="button"
               className={`nav-item ${activeTab === item.id ? 'active' : ''}`}
-              onClick={() => setActiveTab(item.id)}
+              onClick={() => {
+                setActiveTab(item.id);
+                if (!isClientA) {
+                  void refreshServerOverview(false);
+                }
+              }}
             >
               {item.icon}
               <span>{item.label}</span>
@@ -352,7 +357,7 @@ export const App: React.FC = () => {
                   envInfo={envInfo}
                   overview={serverOverview}
                   loading={serverLoading}
-                  onRefresh={refreshServerOverview}
+                  onRefresh={() => refreshServerOverview(true)}
                   onNotify={notify}
                   onNavigate={setActiveTab}
                 />

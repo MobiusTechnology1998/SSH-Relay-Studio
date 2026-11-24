@@ -3,13 +3,16 @@ import {
   buildBrowserLaunchArgs,
   buildSshTunnelArgs,
   buildTerminalProxySnippets,
+  computeNodeConfigHash,
   computeReconnectDelayMs,
   decodeOpenSshOctalEscapes,
   diagnoseSshError,
   formatKnownHostsTarget,
   isHardSshAuthFailure,
   isNonFatalChannelOpenError,
+  isPort22FirewallRule,
 } from '../src/shared/commandBuilders';
+import { parseScQfailureOutput } from '../src/main/serverB/opensshService';
 import {
   expandWindowsEnvVars,
   resolveDefaultBrowserProfileDir,
@@ -202,5 +205,56 @@ describe('commandBuilders', () => {
   it('formats known_hosts target properly for port 22 and custom ports', () => {
     expect(formatKnownHostsTarget('1.2.3.4', 22)).toBe('1.2.3.4');
     expect(formatKnownHostsTarget('1.2.3.4', 53622)).toBe('[1.2.3.4]:53622');
+  });
+
+  it('parses sc.exe qfailure output on both English and Chinese Windows', () => {
+    expect(parseScQfailureOutput('FAILURE_ACTIONS: RESTART -- Delay = 5000 milliseconds.')).toBe(true);
+    expect(parseScQfailureOutput('故障操作: 重新启动 -- 延迟 = 5000 毫秒。')).toBe(true);
+    expect(parseScQfailureOutput('FAILURE_ACTIONS: NONE')).toBe(false);
+  });
+
+  it('accurately detects enabled port 22 firewall rules with or without protocol prefixes', () => {
+    expect(
+      isPort22FirewallRule({
+        name: 'OpenSSH-Server-In-TCP',
+        displayName: 'OpenSSH Server (sshd)',
+        enabled: true,
+        localPort: 'TCP 22',
+      })
+    ).toBe(true);
+    expect(
+      isPort22FirewallRule({
+        name: 'Custom-22',
+        displayName: 'Custom',
+        enabled: true,
+        localPort: 'TCP 22,2222',
+      })
+    ).toBe(true);
+    expect(
+      isPort22FirewallRule({
+        name: 'SSH-Port-53622',
+        displayName: 'OpenSSH Server (TCP 53622)',
+        enabled: true,
+        localPort: 'TCP 53622',
+      })
+    ).toBe(false);
+    expect(
+      isPort22FirewallRule({
+        name: 'OpenSSH-Server-In-TCP',
+        displayName: 'OpenSSH Server (sshd)',
+        enabled: false,
+        localPort: 'TCP 22',
+      })
+    ).toBe(false);
+  });
+
+  it('detects node config drift via deterministic config hash', () => {
+    const h1 = computeNodeConfigHash(BASE_NODE);
+    const h2 = computeNodeConfigHash({ ...BASE_NODE, notes: 'changed note only' });
+    const h3 = computeNodeConfigHash({ ...BASE_NODE, poolSize: 5 });
+    const h4 = computeNodeConfigHash({ ...BASE_NODE, engine: 'hysteria2' });
+    expect(h1).toBe(h2);
+    expect(h1).not.toBe(h3);
+    expect(h1).not.toBe(h4);
   });
 });

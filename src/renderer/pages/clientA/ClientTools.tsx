@@ -204,19 +204,25 @@ export const ClientTools: React.FC<ClientToolsProps> = ({
               {envInfo?.hysteriaClient.path || '自动托管目录'}
             </div>
             <div className="row-wrap">
-              <button
-                className="btn btn-sm btn-primary"
-                onClick={handleDownloadHysteria}
-                disabled={engineBusy}
-              >
-                {engineBusy ? '处理中...' : '一键下载 Hysteria 2'}
-              </button>
+              {envInfo?.hysteriaClient.installed ? (
+                <button className="btn btn-sm" disabled>
+                  ✓ 已安装 ({envInfo.hysteriaClient.version ?? 'v2'})
+                </button>
+              ) : (
+                <button
+                  className="btn btn-sm btn-primary"
+                  onClick={handleDownloadHysteria}
+                  disabled={engineBusy}
+                >
+                  {engineBusy ? '下载中...' : '一键下载 Hysteria 2'}
+                </button>
+              )}
               <button
                 className="btn btn-sm"
                 onClick={handleImportHysteria}
                 disabled={engineBusy}
               >
-                导入本地 hysteria.exe
+                {envInfo?.hysteriaClient.installed ? '替换本地文件' : '导入本地 hysteria.exe'}
               </button>
             </div>
           </div>

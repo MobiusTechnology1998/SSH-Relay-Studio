@@ -8,7 +8,7 @@ import {
 } from '../../shared/authorizedKeys';
 import type { ActionResult, AuthorizedKeysState } from '../../shared/types';
 import { logger } from '../logger';
-import { execCmd, IS_WINDOWS, sha256FingerprintFromBase64 } from '../platform/shell';
+import { execCmd, IS_WINDOWS, runPowerShell, sha256FingerprintFromBase64 } from '../platform/shell';
 
 export const ADMIN_AUTH_KEYS_PATH = 'C:\\ProgramData\\ssh\\administrators_authorized_keys';
 
@@ -33,8 +33,9 @@ export function resolveAuthorizedKeysPath(
 }
 
 /**
- * Checks whether icacls ACL on administrators_authorized_keys only grants Administrators and SYSTEM
- * (no inherited Users/Everyone/Authenticated Users permissions).
+ * Checks whether ACL on administrators_authorized_keys is strictly compliant using
+ * locale-independent Windows SIDs (`S-1-5-32-544` = Administrators, `S-1-5-18` = SYSTEM)
+ * and verifies inheritance is disabled (`AreAccessRulesProtected`).
  */
 export async function inspectAuthorizedKeysPermissions(
   filePath: string
@@ -46,29 +47,62 @@ export async function inspectAuthorizedKeysPermissions(
     return { valid: false, raw: '公钥文件尚未创建' };
   }
 
-  const res = await execCmd('icacls.exe', [filePath], { timeoutMs: 8000 });
-  const raw = (res.stdout || res.stderr).trim();
-  if (res.code !== 0) {
-    return { valid: false, raw: raw || '无法读取 ACL 权限' };
+  const escaped = filePath.replace(/'/g, "''");
+  const psScript = `
+    $acl = Get-Acl -LiteralPath '${escaped}'
+    $entries = @()
+    $allowedSids = @('S-1-5-32-544', 'S-1-5-18')
+    $hasAdmins = $false
+    $hasSystem = $false
+    $hasExtraOrInherited = $false
+    foreach ($rule in $acl.Access) {
+      $sid = ''
+      try {
+        $sid = $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+      } catch {
+        $sid = $rule.IdentityReference.Value
+      }
+      if ($sid -eq 'S-1-5-32-544') { $hasAdmins = $true }
+      if ($sid -eq 'S-1-5-18') { $hasSystem = $true }
+      if ($rule.IsInherited -or ($allowedSids -notcontains $sid)) {
+        $hasExtraOrInherited = $true
+      }
+      $entries += "$($rule.IdentityReference.Value) ($sid): $($rule.FileSystemRights) [Inherited=$($rule.IsInherited)]"
+    }
+    [PSCustomObject]@{
+      valid = [bool]($acl.AreAccessRulesProtected -and $hasAdmins -and $hasSystem -and (-not $hasExtraOrInherited))
+      raw = ($entries -join "\`n")
+    } | ConvertTo-Json -Compress
+  `;
+
+  const res = await runPowerShell(psScript, 10000);
+  if (res.code === 0 && res.stdout.trim()) {
+    try {
+      const parsed = JSON.parse(res.stdout.trim()) as { valid?: boolean; raw?: string };
+      return {
+        valid: Boolean(parsed.valid),
+        raw: parsed.raw || '已校验 ACL 权限',
+      };
+    } catch {
+      // Fall through to icacls fallback
+    }
   }
 
-  // Check ACL entries: should not contain (I) inherited markers or Users / Everyone / Authenticated Users
+  const fallback = await execCmd('icacls.exe', [filePath], { timeoutMs: 8000 });
+  const raw = (fallback.stdout || fallback.stderr).trim();
+  if (fallback.code !== 0) {
+    return { valid: false, raw: raw || '无法读取 ACL 权限' };
+  }
   const lines = raw
     .split(/\r?\n/)
     .map((l) => l.trim())
     .filter((l) => l && !l.startsWith('Successfully processed') && !l.startsWith('已成功处理'));
-
   const hasInherited = lines.some((l) => /\(I\)/.test(l));
   const hasBroadPrincipal = lines.some((l) =>
-    /(BUILTIN\\Users|Everyone|Authenticated Users|NT AUTHORITY\\Authenticated Users|Users:|Everyone:)/i.test(
-      l
-    )
+    /(BUILTIN\\Users|Everyone|Authenticated Users|Users:|Everyone:)/i.test(l)
   );
-  const hasAdmins = lines.some((l) => /Administrators/i.test(l));
-  const hasSystem = lines.some((l) => /SYSTEM/i.test(l));
-
   return {
-    valid: !hasInherited && !hasBroadPrincipal && hasAdmins && hasSystem,
+    valid: !hasInherited && !hasBroadPrincipal && lines.length > 0,
     raw,
   };
 }

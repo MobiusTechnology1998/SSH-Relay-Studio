@@ -102,7 +102,8 @@ export async function generateEd25519KeyPair(
   };
 }
 
-function isTargetTrustedInKnownHosts(host: string, port: number, keyData?: string): boolean {
+export function isHostKeyTrusted(host: string, port: number, keyData?: string): boolean {
+  if (!host.trim()) return false;
   const khPath = getKnownHostsPath();
   if (!fs.existsSync(khPath)) return false;
 
@@ -179,7 +180,7 @@ export async function scanHostKeys(host: string, port: number): Promise<HostKeyS
   }
 
   const alreadyTrusted = entries.some((e) =>
-    isTargetTrustedInKnownHosts(cleanHost, port, e.keyData)
+    isHostKeyTrusted(cleanHost, port, e.keyData)
   );
 
   logger.info(
