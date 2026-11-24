@@ -1,14 +1,31 @@
 import React, { useEffect, useState } from 'react';
 import { computeNodeConfigHash, formatSshCommandPreview } from '../../../shared/commandBuilders';
-import type { AppSettings, NodeProfile, TunnelStatus } from '../../../shared/types';
-import { IconGlobe, IconPower, IconRefresh, IconShield } from '../../components/Icons';
+import { decodePairingToken } from '../../../shared/pairingCodec';
+import type {
+  AppSettings,
+  EnvironmentInfo,
+  KeyPairInfo,
+  NodeProfile,
+  TunnelStatus,
+} from '../../../shared/types';
+import {
+  IconCheck,
+  IconCopy,
+  IconGlobe,
+  IconKey,
+  IconPower,
+  IconRefresh,
+  IconShield,
+} from '../../components/Icons';
 import { StatusBadge } from '../../components/StatusBadge';
 
 interface ClientDashboardProps {
+  envInfo: EnvironmentInfo | null;
   settings: AppSettings;
   tunnelStatus: TunnelStatus;
   activeNode: NodeProfile | null;
   onUpdateSettings: (patch: Partial<AppSettings>) => Promise<void>;
+  onRefreshEnv: () => Promise<void>;
   onNotify: (type: 'success' | 'error' | 'warn' | 'info', msg: string) => void;
   onNavigate: (tab: string) => void;
 }
@@ -36,15 +53,27 @@ function formatBytes(bytes: number): string {
 }
 
 export const ClientDashboard: React.FC<ClientDashboardProps> = ({
+  envInfo,
   settings,
   tunnelStatus,
   activeNode,
   onUpdateSettings,
+  onRefreshEnv,
   onNotify,
   onNavigate,
 }) => {
   const [busy, setBusy] = useState(false);
+  const [quicInstallBusy, setQuicInstallBusy] = useState(false);
+  const [keyInfo, setKeyInfo] = useState<KeyPairInfo | null>(null);
+  const [pairingInput, setPairingInput] = useState('');
+  const [onboardingBusy, setOnboardingBusy] = useState(false);
   const [now, setNow] = useState(Date.now());
+
+  useEffect(() => {
+    if (settings.nodes.length === 0) {
+      window.relayApi.getKeyPairInfo().then(setKeyInfo);
+    }
+  }, [settings.nodes.length]);
 
   useEffect(() => {
     if (tunnelStatus.state !== 'connected' && tunnelStatus.state !== 'reconnecting') return;
@@ -180,6 +209,119 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
     }
   };
 
+  const handleOneClickKeyCopy = async () => {
+    setOnboardingBusy(true);
+    try {
+      let currentKey = keyInfo;
+      if (!currentKey?.exists || !currentKey.publicKey) {
+        const gen = await window.relayApi.generateKeyPair(false);
+        if (!gen.ok || !gen.data?.publicKey) {
+          onNotify('error', gen.message || '生成密钥对失败');
+          return;
+        }
+        currentKey = gen.data;
+        setKeyInfo(gen.data);
+      }
+      await window.relayApi.copyText(currentKey.publicKey);
+      onNotify('success', '已复制本机 ed25519 公钥！请发送并粘贴到设备 B 首页的第 1 步。');
+    } finally {
+      setOnboardingBusy(false);
+    }
+  };
+
+  const handleQuickImportPairing = async () => {
+    if (!pairingInput.trim()) {
+      onNotify('warn', '请粘贴设备 B 生成的 SSHR1:... 配对码');
+      return;
+    }
+    setOnboardingBusy(true);
+    try {
+      const payload = decodePairingToken(pairingInput);
+      const hasQuic = Boolean(payload.quic);
+      const newNode: NodeProfile = {
+        id: `node-${Date.now()}`,
+        name: payload.name,
+        host: payload.host,
+        sshPort: payload.sshPort,
+        username: payload.username,
+        mode: 'socks5',
+        localPort: 1080,
+        remoteProxyPort: 7890,
+        privateKeyPath: '',
+        expectedHostKey: payload.hostPublicKey,
+        poolSize: 3,
+        forceIpv4: true,
+        preferFastCipher: true,
+        healthCheckEnabled: true,
+        healthCheckIntervalSec: 25,
+        engine: hasQuic ? 'hysteria2' : 'openssh',
+        autoFallbackToSsh: true,
+        quicUdpPort: payload.quic?.udpPort ?? 53623,
+        quicAuthToken: payload.quic?.authToken,
+        quicCertPinSha256: payload.quic?.certPinSha256,
+        quicSni: payload.quic?.sni ?? 'www.bing.com',
+        quicObfsPassword: payload.quic?.obfsPassword,
+        quicUpMbps: 50,
+        quicDownMbps: 200,
+      };
+
+      if (payload.hostPublicKey) {
+        const parts = payload.hostPublicKey.trim().split(/\s+/);
+        if (parts.length >= 2) {
+          await window.relayApi.trustHostKeys(payload.host, payload.sshPort, [
+            { keyType: parts[0], keyData: parts[1] },
+          ]);
+        }
+      }
+
+      await onUpdateSettings({
+        nodes: [...settings.nodes, newNode],
+        activeNodeId: newNode.id,
+      });
+      setPairingInput('');
+      onNotify(
+        'success',
+        hasQuic
+          ? `配对完成！已导入「${newNode.name}」并自动启用 QUIC 加速与主机指纹信任，点击「启动隧道」即可使用。`
+          : `配对完成！已导入「${newNode.name}」并自动信任主机指纹，点击「启动隧道」即可使用。`
+      );
+    } catch (err) {
+      onNotify('error', (err as Error).message);
+    } finally {
+      setOnboardingBusy(false);
+    }
+  };
+
+  const handleDownloadQuicClient = async () => {
+    setQuicInstallBusy(true);
+    try {
+      const res = await window.relayApi.downloadHysteriaBinary('clientA');
+      onNotify(res.ok ? 'success' : 'error', res.message);
+      await onRefreshEnv();
+    } finally {
+      setQuicInstallBusy(false);
+    }
+  };
+
+  const handleImportQuicClient = async () => {
+    const file = await window.relayApi.selectFile('选择本地 Hysteria 2 可执行文件', [
+      { name: 'Hysteria 2', extensions: ['exe'] },
+    ]);
+    if (!file) return;
+    setQuicInstallBusy(true);
+    try {
+      const res = await window.relayApi.importHysteriaBinary('clientA', file);
+      onNotify(res.ok ? 'success' : 'error', res.message);
+      await onRefreshEnv();
+    } finally {
+      setQuicInstallBusy(false);
+    }
+  };
+
+  const missingQuicClient = Boolean(
+    activeNode?.engine === 'hysteria2' && envInfo && !envInfo.hysteriaClient.installed
+  );
+
   return (
     <div className="stack-md">
       <div className="page-header">
@@ -202,76 +344,181 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
         </div>
       </div>
 
-      {/* Hero Connection Control */}
-      <div className="hero-connect-card">
-        <div className="hero-status-left">
-          <div className={`status-orb ${tunnelStatus.state}`}>
-            <IconPower size={24} />
-          </div>
-          <div style={{ minWidth: 0 }}>
-            <div className="hero-status-title">
-              <span>{statusMeta.label}</span>
-              <StatusBadge variant={statusMeta.badge} label={engineLabel} />
-              {tunnelStatus.fallbackActive && (
-                <StatusBadge variant="warn" label="已容灾回退" />
-              )}
+      {/* Zero-Friction First-Time Onboarding when no nodes configured */}
+      {settings.nodes.length === 0 ? (
+        <div className="card stack-md">
+          <div className="card-header" style={{ marginBottom: 0 }}>
+            <div>
+              <h3 className="card-title">首次使用 · 2 步极速配对设备 B</h3>
+              <p className="card-subtitle">
+                无需手工填写 IP、端口或信任指纹，按顺序完成以下两步即可一键启动跨国加速
+              </p>
             </div>
-            <div className="hero-status-meta">
-              {activeNode ? (
-                <>
-                  <span>
-                    节点：<strong>{activeNode.name}</strong>
-                  </span>
-                  <span className="mono">
-                    {activeNode.engine === 'hysteria2' && !tunnelStatus.fallbackActive
-                      ? `QUIC ${activeNode.host}:${activeNode.quicUdpPort ?? 53623}`
-                      : `${activeNode.username}@${activeNode.host}:${activeNode.sshPort}`}
-                  </span>
-                  <span className="mono">
-                    本地入口：
-                    {activeNode.mode === 'socks5' ? 'socks5://' : 'http://'}
-                    127.0.0.1:{activeNode.localPort}
-                  </span>
-                </>
-              ) : (
-                <span>尚未配置中转节点，请先在「节点管理」中导入设备 B 配对码或手动新建。</span>
-              )}
-            </div>
+            <button className="btn btn-sm" onClick={() => onNavigate('nodes')}>
+              手动创建节点
+            </button>
           </div>
-        </div>
 
-        <div className="row-wrap" style={{ flexShrink: 0 }}>
-          {tunnelStatus.state === 'connected' && (
-            <button
-              className="btn btn-lg"
-              onClick={handleRotatePool}
-              disabled={busy}
-              title="先建立新通道再优雅排空旧通道，业务不断流"
-            >
-              <IconRefresh size={16} />
-              无感轮换
-            </button>
-          )}
-          {isRunning && (
-            <button
-              className="btn btn-lg"
-              onClick={handleReconnect}
-              disabled={busy}
-              title="强制断开并重建全部连接"
-            >
-              立即重连
-            </button>
-          )}
-          <button
-            className={`btn btn-lg ${isRunning ? 'btn-danger' : 'btn-primary'}`}
-            onClick={handleToggleTunnel}
-            disabled={busy}
-          >
-            <IconPower size={17} />
-            {isRunning ? '断开隧道' : '启动隧道'}
-          </button>
+          <div className="step-item">
+            <div className={`step-num ${keyInfo?.exists ? 'done' : 'active'}`}>
+              {keyInfo?.exists ? <IconCheck size={14} /> : '1'}
+            </div>
+            <div className="step-body">
+              <div className="step-title">
+                <IconKey size={15} />
+                获取本机公钥并发送给设备 B
+                <StatusBadge
+                  variant={keyInfo?.exists ? 'success' : 'warn'}
+                  label={keyInfo?.exists ? '密钥已就绪' : '待生成'}
+                />
+              </div>
+              <p className="step-desc">
+                点击下方按钮将自动生成（如尚未创建）并复制本机 <code className="mono">ed25519</code> 公钥，粘贴到设备 B 首页的第 1 步完成免密授权。
+              </p>
+              <div className="row-wrap">
+                <button
+                  className="btn btn-primary"
+                  onClick={handleOneClickKeyCopy}
+                  disabled={onboardingBusy}
+                >
+                  <IconCopy size={15} />
+                  {keyInfo?.exists ? '一键复制本机公钥（发给设备 B）' : '一键生成并复制本机公钥'}
+                </button>
+                {keyInfo?.fingerprint && (
+                  <span className="mono" style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+                    指纹：{keyInfo.fingerprint}
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="step-item">
+            <div className="step-num active">2</div>
+            <div className="step-body">
+              <div className="step-title">粘贴设备 B 生成的配对码（SSHR1:...）</div>
+              <p className="step-desc">
+                在设备 B 首页点击「一键生成并复制配对码」后粘贴到此处，将自动导入节点、启用 QUIC 加速并信任 SSH 主机指纹。
+              </p>
+              <div className="stack-sm">
+                <textarea
+                  className="textarea"
+                  rows={3}
+                  value={pairingInput}
+                  onChange={(e) => setPairingInput(e.target.value)}
+                  placeholder="SSHR1:eyJ2ZXJzaW9uIjoxLC..."
+                />
+                <div className="row-wrap">
+                  <button
+                    className="btn btn-primary"
+                    onClick={handleQuickImportPairing}
+                    disabled={onboardingBusy || !pairingInput.trim()}
+                  >
+                    {onboardingBusy ? '正在解析导入...' : '一键导入并就绪'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
-      </div>
+      ) : (
+        /* Hero Connection Control */
+        <div className="hero-connect-card">
+          <div className="hero-status-left">
+            <div className={`status-orb ${tunnelStatus.state}`}>
+              <IconPower size={24} />
+            </div>
+            <div style={{ minWidth: 0 }}>
+              <div className="hero-status-title">
+                <span>{statusMeta.label}</span>
+                <StatusBadge variant={statusMeta.badge} label={engineLabel} />
+                {tunnelStatus.fallbackActive && (
+                  <StatusBadge variant="warn" label="已容灾回退" />
+                )}
+              </div>
+              <div className="hero-status-meta">
+                {activeNode ? (
+                  <>
+                    <span>
+                      节点：<strong>{activeNode.name}</strong>
+                    </span>
+                    <span className="mono">
+                      {activeNode.engine === 'hysteria2' && !tunnelStatus.fallbackActive
+                        ? `QUIC ${activeNode.host}:${activeNode.quicUdpPort ?? 53623}`
+                        : `${activeNode.username}@${activeNode.host}:${activeNode.sshPort}`}
+                    </span>
+                    <span className="mono">
+                      本地入口：
+                      {activeNode.mode === 'socks5' ? 'socks5://' : 'http://'}
+                      127.0.0.1:{activeNode.localPort}
+                    </span>
+                  </>
+                ) : (
+                  <span>尚未配置中转节点，请先在「节点管理」中导入设备 B 配对码或手动新建。</span>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="row-wrap" style={{ flexShrink: 0 }}>
+            {tunnelStatus.state === 'connected' && (
+              <button
+                className="btn btn-lg"
+                onClick={handleRotatePool}
+                disabled={busy}
+                title="先建立新通道再优雅排空旧通道，业务不断流"
+              >
+                <IconRefresh size={16} />
+                无感轮换
+              </button>
+            )}
+            {isRunning && (
+              <button
+                className="btn btn-lg"
+                onClick={handleReconnect}
+                disabled={busy}
+                title="强制断开并重建全部连接"
+              >
+                立即重连
+              </button>
+            )}
+            <button
+              className={`btn btn-lg ${isRunning ? 'btn-danger' : 'btn-primary'}`}
+              onClick={handleToggleTunnel}
+              disabled={busy}
+            >
+              <IconPower size={17} />
+              {isRunning ? '断开隧道' : '启动隧道'}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* In-Place Missing QUIC Client Kernel Banner */}
+      {missingQuicClient && (
+        <div className="callout callout-warn row-between" style={{ gap: 12 }}>
+          <div>
+            <strong>缺少 QUIC 加速内核：</strong>当前节点已配置 Hysteria 2 (QUIC) 跨国加速，但本机尚未安装{' '}
+            <code className="mono">hysteria.exe</code>（若直接启动将自动回退至 OpenSSH 多隧道）。
+          </div>
+          <div className="row-wrap" style={{ flexShrink: 0 }}>
+            <button
+              className="btn btn-sm btn-primary"
+              onClick={handleDownloadQuicClient}
+              disabled={quicInstallBusy}
+            >
+              {quicInstallBusy ? '正在下载...' : '一键下载 QUIC 内核'}
+            </button>
+            <button
+              className="btn btn-sm"
+              onClick={handleImportQuicClient}
+              disabled={quicInstallBusy}
+            >
+              导入本地文件
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Config Drift Banner */}
       {configDrifted && activeNode && (

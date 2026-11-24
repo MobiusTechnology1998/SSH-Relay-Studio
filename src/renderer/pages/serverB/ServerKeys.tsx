@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import type { ServerOverview } from '../../../shared/types';
-import { IconKey, IconShield } from '../../components/Icons';
+import { IconCopy, IconKey, IconShield } from '../../components/Icons';
 import { StatusBadge } from '../../components/StatusBadge';
 
 interface ServerKeysProps {
@@ -65,9 +65,9 @@ export const ServerKeys: React.FC<ServerKeysProps> = ({
     <div className="stack-md">
       <div className="page-header">
         <div>
-          <h1 className="page-title">授权公钥与权限管理</h1>
+          <h1 className="page-title">设备公钥与连接</h1>
           <p className="page-desc">
-            管理 <code className="mono">{authState?.filePath ?? 'C:\\ProgramData\\ssh\\administrators_authorized_keys'}</code>，安全追加多台设备 A 公钥并确保 ACL 合规
+            管理 <code className="mono">{authState?.filePath ?? 'C:\\ProgramData\\ssh\\administrators_authorized_keys'}</code> 授权设备，并查看当前连入的设备 A 来源 IP
           </p>
         </div>
       </div>
@@ -192,6 +192,80 @@ export const ServerKeys: React.FC<ServerKeysProps> = ({
         <div className="code-block" style={{ fontSize: 11.8 }}>
           {authState?.permissionsRaw || '尚未读取到权限信息'}
         </div>
+      </div>
+
+      {/* Active SSH/RDP Connections & Device A Source IP Lookup */}
+      <div className="card stack-sm">
+        <div className="card-header" style={{ marginBottom: 4 }}>
+          <div>
+            <h3 className="card-title">当前活跃连接与设备 A 来源 IP 反查</h3>
+            <p className="card-subtitle">
+              用于确认设备 A 是否已通过高位端口成功连入，以及快速复制来源 IP（/32）用于云服务器安全组白名单收紧
+            </p>
+          </div>
+          <button
+            className="btn btn-sm"
+            onClick={async () => {
+              setBusy(true);
+              try {
+                await onRefresh();
+              } finally {
+                setBusy(false);
+              }
+            }}
+            disabled={busy}
+          >
+            刷新连接列表
+          </button>
+        </div>
+
+        {overview && overview.activeConnections.length > 0 ? (
+          <div className="table-wrap">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>服务</th>
+                  <th>本地监听</th>
+                  <th>设备 A 来源 IP</th>
+                  <th>状态</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {overview.activeConnections.map((conn, idx) => (
+                  <tr key={`${conn.remoteAddress}-${conn.pid}-${idx}`}>
+                    <td>
+                      <StatusBadge
+                        variant={conn.category === 'ssh' ? 'success' : 'accent'}
+                        dot={false}
+                        label={conn.category.toUpperCase()}
+                      />
+                    </td>
+                    <td className="mono">{conn.localAddress}</td>
+                    <td className="mono">{conn.remoteAddress}</td>
+                    <td>{conn.state}</td>
+                    <td>
+                      <button
+                        className="btn btn-sm"
+                        onClick={async () => {
+                          await window.relayApi.copyText(`${conn.remoteIp}/32`);
+                          onNotify('success', `已复制安全组白名单规则：${conn.remoteIp}/32`);
+                        }}
+                      >
+                        <IconCopy size={13} />
+                        复制 /32
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="callout">
+            当前暂无活跃的 SSH 或 RDP 外部连接；在设备 A 启动隧道后点击「刷新连接列表」即可看到来源 IP。
+          </div>
+        )}
       </div>
     </div>
   );

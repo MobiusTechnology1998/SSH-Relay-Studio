@@ -1,17 +1,23 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
+import { isPort22FirewallRule } from '../../../shared/commandBuilders';
 import { encodePairingToken } from '../../../shared/pairingCodec';
 import type { EnvironmentInfo, ServerOverview } from '../../../shared/types';
-import { IconCopy, IconRefresh, IconServer, IconShield } from '../../components/Icons';
-import { Modal } from '../../components/Modal';
+import { IconCheck, IconCopy, IconRefresh, IconServer } from '../../components/Icons';
 import { StatusBadge } from '../../components/StatusBadge';
 
 interface ServerDashboardProps {
   envInfo: EnvironmentInfo | null;
   overview: ServerOverview | null;
   loading: boolean;
-  onRefresh: () => Promise<void>;
+  onRefresh: (force?: boolean) => Promise<void>;
   onNotify: (type: 'success' | 'error' | 'warn' | 'info', msg: string) => void;
   onNavigate: (tab: string) => void;
+}
+
+interface DeployLogItem {
+  label: string;
+  state: 'pending' | 'active' | 'done' | 'error';
+  detail?: string;
 }
 
 export const ServerDashboard: React.FC<ServerDashboardProps> = ({
@@ -22,25 +28,204 @@ export const ServerDashboard: React.FC<ServerDashboardProps> = ({
   onNotify,
   onNavigate,
 }) => {
-  const [busy, setBusy] = useState(false);
-  const [pairingOpen, setPairingOpen] = useState(false);
+  const [pubKeyInput, setPubKeyInput] = useState('');
+  const [targetPort, setTargetPort] = useState(53622);
+  const [enableQuic, setEnableQuic] = useState(true);
+  const [quicUdpPort, setQuicUdpPort] = useState(53623);
   const [exportHost, setExportHost] = useState('');
-  const [exportName, setExportName] = useState('');
-  const [exportUser, setExportUser] = useState('Administrator');
-  const [generatedToken, setGeneratedToken] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [deployLogs, setDeployLogs] = useState<DeployLogItem[]>([]);
+  const [copiedRecently, setCopiedRecently] = useState(false);
 
-  const openPairingModal = () => {
-    const defaultHost = overview?.detectedPublicIp || overview?.localIps[0] || '';
-    const defaultName = envInfo?.hostname ? `中转端 (${envInfo.hostname})` : '设备 B 中转节点';
-    const defaultUser = envInfo?.username || 'Administrator';
-    setExportHost(defaultHost);
-    setExportName(defaultName);
-    setExportUser(defaultUser);
-    setGeneratedToken('');
-    setPairingOpen(true);
+  useEffect(() => {
+    if (!overview) return;
+    if (overview.config.port && overview.config.port !== 22) {
+      setTargetPort(overview.config.port);
+    }
+    if (overview.quicServer.udpPort) {
+      setQuicUdpPort(overview.quicServer.udpPort);
+    }
+    if (!exportHost) {
+      const candidate = overview.detectedPublicIp || overview.localIps[0] || '';
+      if (candidate) setExportHost(candidate);
+    }
+  }, [
+    overview?.config.port,
+    overview?.quicServer.udpPort,
+    overview?.detectedPublicIp,
+    overview?.localIps,
+  ]);
+
+  const svcRunning = overview?.service.status === 'Running';
+  const step1Done = Boolean(
+    overview && overview.authorizedKeys.keys.length > 0 && overview.authorizedKeys.permissionsValid
+  );
+  const sshHardened = Boolean(
+    svcRunning &&
+      overview &&
+      overview.config.port !== 22 &&
+      overview.config.pubkeyAuthentication &&
+      !overview.config.passwordAuthentication &&
+      overview.service.failureRecoveryConfigured &&
+      overview.updatePolicy.autoRebootDisabled &&
+      overview.systemTuning.tuned
+  );
+  const quicReady = Boolean(
+    overview?.quicServer.running && overview?.quicServer.configured
+  );
+  const step2Done = sshHardened && (!enableQuic || quicReady);
+
+  const port22StillEnabled = Boolean(
+    overview?.firewallRules.some((r) => isPort22FirewallRule(r))
+  );
+
+  const handleAuthorizeKey = async () => {
+    if (!pubKeyInput.trim()) {
+      onNotify('warn', '请先粘贴设备 A 复制的 ssh-ed25519 公钥');
+      return;
+    }
+    setBusy(true);
+    try {
+      const res = await window.relayApi.addServerAuthorizedKey(pubKeyInput, 'Device-A');
+      onNotify(res.ok ? 'success' : 'error', res.message);
+      if (res.ok) setPubKeyInput('');
+      await onRefresh(false);
+    } finally {
+      setBusy(false);
+    }
   };
 
-  const handleGenerateToken = () => {
+  /**
+   * True 1-click turnkey provisioning for Device B:
+   * Installs/starts OpenSSH -> opens firewall -> writes hardened weak-network sshd_config -> restarts sshd
+   * -> enables 5s crash recovery + anti-reboot + TCP CUBIC/anti-sleep -> optionally installs & starts QUIC Hysteria 2.
+   */
+  const handleOneClickDeploy = async () => {
+    if (!step1Done) {
+      onNotify('error', '防锁死拦截：请先完成第 1 步（粘贴并授权至少 1 个设备 A 公钥）');
+      return;
+    }
+
+    const steps: DeployLogItem[] = [
+      { label: '1. 安装并启动 OpenSSH Server', state: 'pending' },
+      { label: `2. 放行 TCP ${targetPort}、加固 sshd_config（禁用密码 + 弱网高并发）并重启`, state: 'pending' },
+      { label: '3. 配置崩溃 5s 自愈、禁自动更新重启与跨国弱网 TCP 调优', state: 'pending' },
+    ];
+    if (enableQuic) {
+      steps.push({ label: `4. 部署并启动 QUIC (Hysteria 2) 跨国弱网引擎 (UDP ${quicUdpPort})`, state: 'pending' });
+    }
+    setDeployLogs([...steps]);
+    setBusy(true);
+
+    const mark = (idx: number, state: DeployLogItem['state'], detail?: string) => {
+      steps[idx] = { ...steps[idx], state, detail };
+      setDeployLogs([...steps]);
+    };
+
+    try {
+      // Step 1: OpenSSH Server
+      mark(0, 'active');
+      if (!svcRunning) {
+        const installRes = await window.relayApi.installOpenSshServer();
+        if (!installRes.ok) {
+          mark(0, 'error', installRes.message);
+          onNotify('error', installRes.message);
+          return;
+        }
+      }
+      mark(0, 'done', '已运行');
+
+      // Step 2: Firewall + Hardened Weak-Network sshd_config + Restart
+      mark(1, 'active');
+      const fwRes = await window.relayApi.allowFirewallPort(targetPort);
+      if (!fwRes.ok) {
+        mark(1, 'error', fwRes.message);
+        onNotify('error', fwRes.message);
+        return;
+      }
+      const cfgRes = await window.relayApi.applySshdConfig({
+        port: targetPort,
+        pubkeyAuthentication: true,
+        passwordAuthentication: false,
+        tcpKeepAlive: true,
+        clientAliveInterval: 30,
+        clientAliveCountMax: 3,
+        useDns: false,
+        compression: 'no',
+        maxSessions: 64,
+        maxStartups: '30:50:100',
+      });
+      if (!cfgRes.ok) {
+        mark(1, 'error', cfgRes.message);
+        onNotify('error', cfgRes.message);
+        return;
+      }
+      const restartRes = await window.relayApi.controlSshdService('restart');
+      if (!restartRes.ok) {
+        mark(1, 'error', restartRes.message);
+        onNotify('error', restartRes.message);
+        return;
+      }
+      mark(1, 'done', `TCP ${targetPort} 已生效`);
+
+      // Step 3: Crash recovery + Anti-reboot + TCP CUBIC / Anti-sleep
+      mark(2, 'active');
+      const [r1, r2, r3] = await Promise.all([
+        window.relayApi.configureSshdFailureRecovery(),
+        window.relayApi.setDisableAutoReboot(true),
+        window.relayApi.applyServerSystemTuning(),
+      ]);
+      const stErrs = [r1, r2, r3].filter((r) => !r.ok).map((r) => r.message);
+      if (stErrs.length > 0) {
+        mark(2, 'error', stErrs.join(' | '));
+        onNotify('warn', `部分稳定性项未完全生效：${stErrs[0]}`);
+      } else {
+        mark(2, 'done', '全部已生效');
+      }
+
+      // Step 4 (Optional): QUIC / Hysteria 2
+      if (enableQuic) {
+        mark(3, 'active', '检查/下载内核并启动...');
+        if (!overview?.quicServer.binaryInstalled) {
+          const dlRes = await window.relayApi.downloadHysteriaBinary('serverB');
+          if (!dlRes.ok) {
+            mark(3, 'error', '自动下载失败（可到「高级设置」导入本地 hysteria.exe）');
+            onNotify('warn', `OpenSSH 已全部就绪，但 QUIC 自动下载失败：${dlRes.message}`);
+            await onRefresh(false);
+            return;
+          }
+        }
+        const quicRes = await window.relayApi.deployQuicServer({
+          udpPort: quicUdpPort,
+          sni: overview?.quicServer.sni || 'www.bing.com',
+          maxUpMbps: overview?.quicServer.maxUpMbps || 200,
+          maxDownMbps: overview?.quicServer.maxDownMbps || 200,
+          enableObfs: true,
+        });
+        if (!quicRes.ok) {
+          mark(3, 'error', quicRes.message);
+          onNotify('error', quicRes.message);
+          await onRefresh(false);
+          return;
+        }
+        await window.relayApi.configureQuicStartupTask();
+        mark(3, 'done', `UDP ${quicUdpPort} 运行中`);
+      }
+
+      onNotify('success', '中转端已一键完成全部部署与跨国弱网优化！现在可直接复制配对码发给设备 A。');
+      await onRefresh(false);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleOneClickCopyPairing = async () => {
+    const host = (exportHost || overview?.detectedPublicIp || overview?.localIps[0] || '').trim();
+    if (!host) {
+      onNotify('error', '请先填写设备 B 的公网 IP 或域名');
+      return;
+    }
+
     try {
       const qs = overview?.quicServer;
       const quic =
@@ -56,365 +241,367 @@ export const ServerDashboard: React.FC<ServerDashboardProps> = ({
 
       const token = encodePairingToken({
         version: 1,
-        name: exportName,
-        host: exportHost,
-        sshPort: overview?.config.port ?? 53622,
-        username: exportUser,
+        name: envInfo?.hostname ? `中转端 (${envInfo.hostname})` : '设备 B 中转节点',
+        host,
+        sshPort: overview?.config.port ?? targetPort,
+        username: envInfo?.username || 'Administrator',
         hostPublicKey: overview?.hostPublicKey ?? undefined,
         quic,
         createdAt: Date.now(),
       });
-      setGeneratedToken(token);
+
+      await window.relayApi.copyText(token);
+      setCopiedRecently(true);
+      setTimeout(() => setCopiedRecently(false), 3000);
+      onNotify(
+        'success',
+        quic
+          ? '已生成并复制配对码（含 SSH 指纹 + QUIC 跨国加速参数），直接粘贴到设备 A 即可！'
+          : '已生成并复制配对码（含 SSH 主机指纹），直接粘贴到设备 A 即可！'
+      );
     } catch (err) {
       onNotify('error', (err as Error).message);
     }
   };
 
-  const handleCopyToken = async () => {
-    if (!generatedToken) return;
-    await window.relayApi.copyText(generatedToken);
-    onNotify('success', '已复制配对码！在设备 A 的「节点管理」中粘贴即可一键导入并信任指纹。');
-  };
-
-  const handleServiceAction = async (action: 'start' | 'stop' | 'restart') => {
+  const handleClosePort22 = async () => {
     setBusy(true);
     try {
-      const res = await window.relayApi.controlSshdService(action);
+      const res = await window.relayApi.disablePort22FirewallRule();
       onNotify(res.ok ? 'success' : 'error', res.message);
-      await onRefresh();
+      await onRefresh(false);
     } finally {
       setBusy(false);
     }
   };
 
-  const svcRunning = overview?.service.status === 'Running';
-  const hardened =
-    overview &&
-    overview.config.port !== 22 &&
-    overview.config.pubkeyAuthentication &&
-    !overview.config.passwordAuthentication;
+  const handleServiceAction = async (action: 'start' | 'restart' | 'stop') => {
+    setBusy(true);
+    try {
+      const res = await window.relayApi.controlSshdService(action);
+      onNotify(res.ok ? 'success' : 'error', res.message);
+      await onRefresh(false);
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
     <div className="stack-md">
       <div className="page-header">
         <div>
-          <h1 className="page-title">设备 B 中转端总览</h1>
+          <h1 className="page-title">设备 B · 一键部署与总览</h1>
           <p className="page-desc">
-            实时监控 OpenSSH 与 QUIC (Hysteria 2) 服务、监听端口、安全加固状态与来源 IP，支持一键导出配对码给设备 A
+            三步完成中转服务器部署：授权设备 A 公钥 → 一键全自动加固与弱网加速 → 复制配对码
           </p>
         </div>
         <div className="header-actions">
-          <button className="btn" onClick={onRefresh} disabled={loading}>
+          <button className="btn" onClick={() => onRefresh(true)} disabled={loading || busy}>
             <IconRefresh size={15} />
             {loading ? '刷新中...' : '刷新状态'}
-          </button>
-          <button className="btn btn-primary" onClick={openPairingModal}>
-            生成设备 A 配对码
           </button>
         </div>
       </div>
 
-      {/* Top Health KPIs */}
-      <div className="grid-4">
+      {/* Compact 3-KPI Health Strip */}
+      <div className="grid-3">
         <div className="metric-tile">
           <div className="row-between">
-            <span className="metric-label">OpenSSH 服务</span>
+            <span className="metric-label">OpenSSH 通道</span>
             <StatusBadge
-              variant={svcRunning ? 'success' : overview?.service.installed ? 'warn' : 'danger'}
-              label={
-                svcRunning
-                  ? '运行中'
-                  : overview?.service.installed
-                  ? overview.service.status
-                  : '未安装'
-              }
+              variant={svcRunning ? 'success' : 'warn'}
+              label={svcRunning ? `TCP ${overview?.config.port}` : '未运行'}
             />
           </div>
-          <div className="metric-value" style={{ marginTop: 8 }}>
+          <div className="metric-value" style={{ marginTop: 6, fontSize: 15 }}>
             sshd{' '}
             {overview?.service.sshdVersion?.version
               ? `v${overview.service.sshdVersion.version}`
               : ''}
           </div>
           <div className="metric-sub">
-            {overview?.service.sshdVersion?.isLegacy
-              ? '版本较旧(<9.0)，建议升级 Win32-OpenSSH'
-              : `启动：${overview?.service.startType ?? '--'} · 自愈：${
-                  overview?.service.failureRecoveryConfigured ? '已开启' : '未配置'
-                }`}
+            {overview?.config.passwordAuthentication ? '密码登录未关闭' : '仅密钥登录'} · 崩溃自愈
+            {overview?.service.failureRecoveryConfigured ? '已开启' : '未配置'}
           </div>
         </div>
 
         <div className="metric-tile">
           <div className="row-between">
-            <span className="metric-label">SSH 监听端口</span>
+            <span className="metric-label">QUIC 跨国加速 (Hysteria 2)</span>
             <StatusBadge
-              variant={overview?.config.port && overview.config.port !== 22 ? 'success' : 'warn'}
-              label={overview?.config.port === 22 ? '默认 22' : '高位端口'}
+              variant={quicReady ? 'success' : 'neutral'}
+              label={quicReady ? `UDP ${overview?.quicServer.udpPort}` : '未启用'}
             />
           </div>
-          <div className="metric-value" style={{ marginTop: 8 }}>
-            TCP {overview?.config.port ?? '--'}
+          <div className="metric-value" style={{ marginTop: 6, fontSize: 15 }}>
+            {quicReady ? '运行中 (Brutal)' : '待开启'}
           </div>
           <div className="metric-sub">
-            密码登录：{overview?.config.passwordAuthentication ? '未关闭' : '已禁用'}
+            {quicReady
+              ? `自启任务：${overview?.quicServer.startupTaskConfigured ? '已配置' : '未配置'}`
+              : '推荐开启，大幅提升跨国丢包弱网速度'}
           </div>
         </div>
 
         <div className="metric-tile">
           <div className="row-between">
-            <span className="metric-label">已授权公钥</span>
+            <span className="metric-label">公网 IP / 授权设备</span>
             <StatusBadge
-              variant={
-                overview &&
-                overview.authorizedKeys.keys.length > 0 &&
-                overview.authorizedKeys.permissionsValid
-                  ? 'success'
-                  : 'warn'
-              }
-              label={overview?.authorizedKeys.permissionsValid ? '权限合规' : '需检查'}
+              variant={step1Done ? 'success' : 'warn'}
+              label={`${overview?.authorizedKeys.keys.length ?? 0} 台设备`}
             />
           </div>
-          <div className="metric-value" style={{ marginTop: 8 }}>
-            {overview?.authorizedKeys.keys.length ?? 0} 台设备
+          <div className="metric-value" style={{ marginTop: 6, fontSize: 15 }}>
+            {overview?.detectedPublicIp || overview?.localIps[0] || '--'}
           </div>
-          <div className="metric-sub">administrators_authorized_keys</div>
-        </div>
-
-        <div className="metric-tile">
-          <div className="row-between">
-            <span className="metric-label">防自动更新重启</span>
-            <StatusBadge
-              variant={overview?.updatePolicy.autoRebootDisabled ? 'success' : 'neutral'}
-              label={overview?.updatePolicy.autoRebootDisabled ? '已保护' : '系统默认'}
-            />
+          <div className="metric-sub">
+            系统弱网调优：{overview?.systemTuning.tuned ? '已生效' : '待优化'}
           </div>
-          <div className="metric-value" style={{ marginTop: 8, fontSize: 14.5 }}>
-            {overview?.detectedPublicIp || overview?.localIps[0] || '未检测到 IP'}
-          </div>
-          <div className="metric-sub">检测到的公网/本机 IP</div>
         </div>
       </div>
 
-      {/* Quick Control & Hardening Banner */}
-      <div className="grid-2">
-        <div className="card stack-sm">
-          <div className="card-header" style={{ marginBottom: 4 }}>
-            <div>
-              <h3 className="card-title">
-                <IconServer size={16} />
-                sshd 服务控制与监听地址
-              </h3>
-              <p className="card-subtitle">管理 Windows 内置 OpenSSH Server 运行状态</p>
+      {/* Turnkey 3-Step Setup Flow */}
+      <div className="stack-sm">
+        {/* Step 1: Authorize Device A Public Key */}
+        <div className="step-item">
+          <div className={`step-num ${step1Done ? 'done' : 'active'}`}>
+            {step1Done ? <IconCheck size={14} /> : '1'}
+          </div>
+          <div className="step-body">
+            <div className="step-title">
+              粘贴并授权设备 A 公钥（防锁死前提）
+              <StatusBadge
+                variant={step1Done ? 'success' : 'warn'}
+                label={
+                  step1Done
+                    ? `已授权 ${overview?.authorizedKeys.keys.length} 台 · ACL 合规`
+                    : '待完成'
+                }
+              />
+            </div>
+
+            {step1Done ? (
+              <div className="row-between" style={{ marginTop: 4 }}>
+                <span className="step-desc" style={{ margin: 0 }}>
+                  设备 A 公钥已写入并自动收紧 Windows 权限，可安全进入下一步。
+                </span>
+                <button className="btn btn-sm" onClick={() => onNavigate('serverKeys')}>
+                  管理 / 添加更多设备
+                </button>
+              </div>
+            ) : (
+              <div className="stack-sm" style={{ marginTop: 8 }}>
+                <p className="step-desc" style={{ margin: 0 }}>
+                  在设备 A 打开本软件首页点击「复制本机公钥」，粘贴到下方即可自动写入并收紧权限：
+                </p>
+                <textarea
+                  className="textarea"
+                  rows={2}
+                  value={pubKeyInput}
+                  onChange={(e) => setPubKeyInput(e.target.value)}
+                  placeholder="粘贴 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... 公钥"
+                />
+                <div>
+                  <button
+                    className="btn btn-primary"
+                    onClick={handleAuthorizeKey}
+                    disabled={busy || !pubKeyInput.trim()}
+                  >
+                    {busy ? '正在写入并收紧权限...' : '授权该设备 A 公钥'}
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Step 2: True 1-Click Full Provisioning & Optimization */}
+        <div className="step-item">
+          <div className={`step-num ${step2Done ? 'done' : 'active'}`}>
+            {step2Done ? <IconCheck size={14} /> : '2'}
+          </div>
+          <div className="step-body">
+            <div className="step-title">
+              一键全自动部署、安全加固与跨国弱网加速
+              <StatusBadge
+                variant={step2Done ? 'success' : 'warn'}
+                label={step2Done ? '已全部就绪' : '一键完成'}
+              />
+            </div>
+            <p className="step-desc">
+              单次点击自动完成：安装启动 OpenSSH → 切换高位端口并关闭密码登录 → 放行防火墙 → 崩溃自愈/防重启/TCP CUBIC 调优 → 可选一键启用 QUIC (Hysteria 2) 跨国加速。
+            </p>
+
+            <div className="row-wrap" style={{ marginBottom: 10 }}>
+              <label className="field-label">SSH 端口：</label>
+              <input
+                className="input mono"
+                type="number"
+                style={{ width: 100 }}
+                value={targetPort}
+                onChange={(e) => setTargetPort(Number(e.target.value) || 53622)}
+                disabled={busy}
+              />
+              <label className="checkbox-row" style={{ marginLeft: 8 }}>
+                <input
+                  type="checkbox"
+                  checked={enableQuic}
+                  onChange={(e) => setEnableQuic(e.target.checked)}
+                  disabled={busy}
+                />
+                <span>同时启用 QUIC 跨国弱网加速 (UDP</span>
+              </label>
+              <input
+                className="input mono"
+                type="number"
+                style={{ width: 92 }}
+                value={quicUdpPort}
+                onChange={(e) => setQuicUdpPort(Number(e.target.value) || 53623)}
+                disabled={busy || !enableQuic}
+              />
+              <span style={{ fontSize: 13 }}>)</span>
+            </div>
+
+            <div className="row-wrap">
+              <button
+                className={`btn ${step2Done ? '' : 'btn-primary'}`}
+                onClick={handleOneClickDeploy}
+                disabled={busy || !step1Done || step2Done}
+              >
+                {step2Done
+                  ? '✓ 中转端已全部部署并优化就绪'
+                  : busy
+                  ? '正在全自动部署与调优中...'
+                  : '一键全自动部署与优化'}
+              </button>
+              {step2Done && (
+                <button className="btn btn-ghost btn-sm" onClick={() => onNavigate('hardening')}>
+                  进入高级设置微调参数
+                </button>
+              )}
+            </div>
+
+            {deployLogs.length > 0 && (
+              <div className="progress-log-list" style={{ marginTop: 10 }}>
+                {deployLogs.map((item, idx) => (
+                  <div key={idx} className={`progress-log-item ${item.state}`}>
+                    <span>
+                      {item.state === 'done'
+                        ? '✓'
+                        : item.state === 'active'
+                        ? '⏳'
+                        : item.state === 'error'
+                        ? '✕'
+                        : '○'}
+                    </span>
+                    <span>{item.label}</span>
+                    {item.detail && <span className="mono">({item.detail})</span>}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div className="callout callout-accent" style={{ marginTop: 10, fontSize: 12.5 }}>
+              <strong>云安全组提醒：</strong>请在云服务器控制台放行入站{' '}
+              <strong className="mono">TCP {targetPort}</strong>
+              {enableQuic ? (
+                <>
+                  {' '}与 <strong className="mono">UDP {quicUdpPort}</strong>
+                </>
+              ) : null}
+              （来源 <code className="mono">0.0.0.0/0</code>，已强制仅密钥/强鉴权认证）。
             </div>
           </div>
+        </div>
 
-          <div className="row-wrap">
+        {/* Step 3: 1-Click Copy Pairing Code */}
+        <div className="step-item">
+          <div className={`step-num ${step2Done ? 'active' : ''}`}>3</div>
+          <div className="step-body">
+            <div className="step-title">
+              一键复制配对码，发给设备 A 直接导入
+              {quicReady && (
+                <StatusBadge variant="success" dot={false} label="自动附带 QUIC + SSH 指纹" />
+              )}
+            </div>
+            <p className="step-desc">
+              无需手动填 IP/端口/指纹，点击下方按钮自动生成并复制完整配对码，粘贴到设备 A 首页即可立刻连接。
+            </p>
+            <div className="row-wrap">
+              <input
+                className="input mono"
+                style={{ width: 220 }}
+                value={exportHost}
+                onChange={(e) => setExportHost(e.target.value)}
+                placeholder="设备 B 公网 IP 或域名"
+              />
+              <button
+                className={`btn ${copiedRecently ? 'btn-success' : 'btn-primary'}`}
+                onClick={handleOneClickCopyPairing}
+                disabled={!exportHost.trim()}
+              >
+                <IconCopy size={15} />
+                {copiedRecently ? '✓ 已复制配对码！快去设备 A 粘贴' : '一键生成并复制配对码'}
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Contextual Security Tip: Close Legacy Port 22 after A verifies */}
+      {sshHardened && port22StillEnabled && (
+        <div className="callout callout-warn row-between">
+          <div>
+            <strong>安全建议：</strong>本机旧的 <code className="mono">TCP 22</code> 防火墙规则仍处于启用状态。确认设备 A 通过新端口{' '}
+            <code className="mono">{overview?.config.port}</code> 连接成功后，建议立即关闭旧 22 端口。
+          </div>
+          <button className="btn btn-sm btn-primary" onClick={handleClosePort22} disabled={busy}>
+            关闭旧 22 端口规则
+          </button>
+        </div>
+      )}
+
+      {/* Minimal Service Controls Footer Card */}
+      <div className="card row-between">
+        <div className="row-wrap" style={{ gap: 10 }}>
+          <IconServer size={16} />
+          <span style={{ fontWeight: 600 }}>sshd 服务快捷控制</span>
+          <span className="mono" style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+            {overview?.listeningPorts.length
+              ? `监听: ${overview.listeningPorts.join(', ')}`
+              : '未监听'}
+          </span>
+        </div>
+        <div className="row-wrap">
+          {!svcRunning ? (
             <button
-              className="btn btn-primary"
+              className="btn btn-sm btn-primary"
               onClick={() => handleServiceAction('start')}
               disabled={busy || !overview?.service.serviceExists}
             >
               启动 sshd
             </button>
-            <button
-              className="btn"
-              onClick={() => handleServiceAction('restart')}
-              disabled={busy || !overview?.service.serviceExists}
-            >
-              重启 sshd
-            </button>
-            <button
-              className="btn btn-ghost"
-              style={{ color: 'var(--danger)' }}
-              onClick={() => handleServiceAction('stop')}
-              disabled={busy || !overview?.service.serviceExists}
-            >
-              停止
-            </button>
-          </div>
-
-          <div className="callout" style={{ marginTop: 4 }}>
-            <div style={{ fontWeight: 600, marginBottom: 4 }}>当前 LISTENING 地址：</div>
-            {overview && overview.listeningPorts.length > 0 ? (
-              <div className="mono" style={{ fontSize: 12.5 }}>
-                {overview.listeningPorts.join('   |   ')}
-              </div>
-            ) : (
-              <span>未检测到 SSH 监听端口（请先部署或启动 sshd 服务）</span>
-            )}
-          </div>
-        </div>
-
-        <div className="card stack-sm">
-          <div className="card-header" style={{ marginBottom: 4 }}>
-            <div>
-              <h3 className="card-title">
-                <IconShield size={16} />
-                安全加固检查摘要
-              </h3>
-              <p className="card-subtitle">首次部署建议按防锁死向导逐步完成</p>
-            </div>
-            <button className="btn btn-sm btn-primary" onClick={() => onNavigate('deploy')}>
-              打开一键部署向导
-            </button>
-          </div>
-
-          {hardened ? (
-            <div className="callout callout-success">
-              当前中转端已完成核心加固：高位端口 TCP {overview?.config.port}、仅限密钥登录、密码登录已关闭。
-            </div>
           ) : (
-            <div className="callout callout-warn">
-              尚未完成完整加固（建议：追加设备 A 公钥 → 切换高位端口如 53622 → 关闭密码登录 → 禁用旧 22 端口规则）。
-            </div>
+            <>
+              <button
+                className="btn btn-sm"
+                onClick={() => handleServiceAction('restart')}
+                disabled={busy}
+              >
+                重启 sshd
+              </button>
+              <button
+                className="btn btn-sm btn-ghost"
+                style={{ color: 'var(--danger)' }}
+                onClick={() => handleServiceAction('stop')}
+                disabled={busy}
+              >
+                停止
+              </button>
+            </>
           )}
-
-          <div className="row-wrap">
-            <button className="btn btn-sm" onClick={() => onNavigate('serverKeys')}>
-              管理设备 A 公钥
-            </button>
-            <button className="btn btn-sm" onClick={() => onNavigate('hardening')}>
-              防火墙与稳定性设置
-            </button>
-          </div>
         </div>
       </div>
-
-      {/* Active SSH & RDP Connections (Source IP Lookup Tool per ssh.md 2.2) */}
-      <div className="card stack-sm">
-        <div className="card-header" style={{ marginBottom: 4 }}>
-          <div>
-            <h3 className="card-title">当前活跃连接与设备 A 来源 IP 反查</h3>
-            <p className="card-subtitle">
-              若设备 A 无法直接查外网 IP，可通过当前连着本机的远程桌面（RDP :3389）或 SSH 连接直接反查设备 A 的出口 IP，用于配置云安全组白名单
-            </p>
-          </div>
-        </div>
-
-        {overview && overview.activeConnections.length > 0 ? (
-          <div className="table-wrap">
-            <table className="data-table">
-              <thead>
-                <tr>
-                  <th>类型</th>
-                  <th>本机地址</th>
-                  <th>外部来源 IP</th>
-                  <th>完整远端地址</th>
-                  <th>PID</th>
-                  <th>操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                {overview.activeConnections.map((conn, idx) => (
-                  <tr key={idx}>
-                    <td>
-                      <StatusBadge
-                        variant={conn.category === 'ssh' ? 'success' : 'accent'}
-                        dot={false}
-                        label={conn.category === 'ssh' ? 'SSH 隧道' : 'RDP 远程桌面'}
-                      />
-                    </td>
-                    <td className="mono">{conn.localAddress}</td>
-                    <td className="mono" style={{ fontWeight: 650 }}>
-                      {conn.remoteIp}
-                    </td>
-                    <td className="mono">{conn.remoteAddress}</td>
-                    <td className="mono">{conn.pid}</td>
-                    <td>
-                      <button
-                        className="btn btn-sm btn-ghost"
-                        onClick={async () => {
-                          await window.relayApi.copyText(`${conn.remoteIp}/32`);
-                          onNotify('success', `已复制 ${conn.remoteIp}/32（可直接粘贴至云安全组源 IP）`);
-                        }}
-                      >
-                        <IconCopy size={13} /> 复制 /32
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        ) : (
-          <div className="callout">当前暂无活跃的 SSH 或 RDP (3389) 连接记录。</div>
-        )}
-      </div>
-
-      {/* Pairing Code Export Modal */}
-      <Modal
-        open={pairingOpen}
-        title="生成设备 A 专属配对码"
-        subtitle="配对码包含公网 IP、高位 SSH 端口、用户名及本机主机公钥，设备 A 粘贴即可自动配置并信任指纹"
-        onClose={() => setPairingOpen(false)}
-        footer={
-          <>
-            <button className="btn" onClick={() => setPairingOpen(false)}>
-              关闭
-            </button>
-            <button className="btn btn-primary" onClick={handleGenerateToken}>
-              生成配对码
-            </button>
-          </>
-        }
-      >
-        <div className="field">
-          <label className="field-label">节点显示名称</label>
-          <input
-            className="input"
-            value={exportName}
-            onChange={(e) => setExportName(e.target.value)}
-          />
-        </div>
-        <div className="grid-2">
-          <div className="field">
-            <label className="field-label">设备 B 公网 IP / 域名</label>
-            <input
-              className="input mono"
-              value={exportHost}
-              onChange={(e) => setExportHost(e.target.value)}
-              placeholder="例如 203.0.113.10"
-            />
-          </div>
-          <div className="field">
-            <label className="field-label">登录用户名</label>
-            <input
-              className="input mono"
-              value={exportUser}
-              onChange={(e) => setExportUser(e.target.value)}
-            />
-          </div>
-        </div>
-        <div className="callout stack-sm" style={{ gap: 4 }}>
-          <div>
-            SSH 端口：<strong className="mono">{overview?.config.port ?? 53622}</strong> · 主机公钥：
-            <strong>{overview?.hostPublicKey ? '已自动附带（A 端免手输 yes）' : '未读取到'}</strong>
-          </div>
-          <div>
-            QUIC (Hysteria 2)：
-            {overview?.quicServer.configured ? (
-              <strong>
-                已自动附带（UDP {overview.quicServer.udpPort} · 鉴权密钥 + TLS SHA-256 指纹）
-              </strong>
-            ) : (
-              <span>未部署（仅导出 OpenSSH 配对；可在「安全加固与稳定性」一键开启 QUIC 跨国弱网加速）</span>
-            )}
-          </div>
-        </div>
-
-        {generatedToken && (
-          <div className="stack-sm">
-            <div className="code-block" style={{ fontSize: 11.5 }}>
-              {generatedToken}
-            </div>
-            <button className="btn btn-success" onClick={handleCopyToken}>
-              <IconCopy size={15} />
-              复制配对码发给设备 A
-            </button>
-          </div>
-        )}
-      </Modal>
     </div>
   );
 };

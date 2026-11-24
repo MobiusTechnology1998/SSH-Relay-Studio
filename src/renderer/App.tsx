@@ -15,7 +15,6 @@ import {
   IconPower,
   IconServer,
   IconShield,
-  IconWrench,
 } from './components/Icons';
 import { LogDrawer } from './components/LogDrawer';
 import { RoleSelector } from './components/RoleSelector';
@@ -25,7 +24,6 @@ import { ClientKeysPairing } from './pages/clientA/ClientKeysPairing';
 import { ClientNodes } from './pages/clientA/ClientNodes';
 import { ClientTools } from './pages/clientA/ClientTools';
 import { ServerDashboard } from './pages/serverB/ServerDashboard';
-import { ServerDeploy } from './pages/serverB/ServerDeploy';
 import { ServerHardening } from './pages/serverB/ServerHardening';
 import { ServerKeys } from './pages/serverB/ServerKeys';
 
@@ -185,10 +183,9 @@ export const App: React.FC = () => {
   ];
 
   const serverNav = [
-    { id: 'serverDashboard', label: '中转端总览', icon: <IconServer size={17} /> },
-    { id: 'deploy', label: '一键部署向导', icon: <IconWrench size={17} /> },
-    { id: 'serverKeys', label: '授权公钥管理', icon: <IconKey size={17} /> },
-    { id: 'hardening', label: '安全加固与稳定性', icon: <IconShield size={17} /> },
+    { id: 'serverDashboard', label: '一键部署与总览', icon: <IconServer size={17} /> },
+    { id: 'serverKeys', label: '设备公钥与连接', icon: <IconKey size={17} /> },
+    { id: 'hardening', label: '高级设置', icon: <IconShield size={17} /> },
   ];
 
   const navItems = isClientA ? clientNav : serverNav;
@@ -321,10 +318,12 @@ export const App: React.FC = () => {
             <>
               {activeTab === 'dashboard' && (
                 <ClientDashboard
+                  envInfo={envInfo}
                   settings={settings}
                   tunnelStatus={tunnelStatus}
                   activeNode={activeNode}
                   onUpdateSettings={handleUpdateSettings}
+                  onRefreshEnv={refreshEnvInfo}
                   onNotify={notify}
                   onNavigate={setActiveTab}
                 />
@@ -357,29 +356,22 @@ export const App: React.FC = () => {
                   envInfo={envInfo}
                   overview={serverOverview}
                   loading={serverLoading}
-                  onRefresh={() => refreshServerOverview(true)}
+                  onRefresh={(force) => refreshServerOverview(Boolean(force))}
                   onNotify={notify}
                   onNavigate={setActiveTab}
-                />
-              )}
-              {activeTab === 'deploy' && (
-                <ServerDeploy
-                  overview={serverOverview}
-                  onRefresh={refreshServerOverview}
-                  onNotify={notify}
                 />
               )}
               {activeTab === 'serverKeys' && (
                 <ServerKeys
                   overview={serverOverview}
-                  onRefresh={refreshServerOverview}
+                  onRefresh={() => refreshServerOverview(false)}
                   onNotify={notify}
                 />
               )}
               {activeTab === 'hardening' && (
                 <ServerHardening
                   overview={serverOverview}
-                  onRefresh={refreshServerOverview}
+                  onRefresh={() => refreshServerOverview(false)}
                   onNotify={notify}
                 />
               )}

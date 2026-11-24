@@ -1073,3 +1073,79 @@ textarea {
 .toast-item.warn {
   background: #92400e;
 }
+
+/* ===== Collapsible Advanced Drawer ===== */
+.advanced-drawer {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle);
+  padding: 10px 14px;
+}
+
+.advanced-drawer > summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  list-style: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  user-select: none;
+}
+
+.advanced-drawer > summary::-webkit-details-marker {
+  display: none;
+}
+
+.advanced-drawer > summary::after {
+  content: '展开 ▾';
+  font-size: 12px;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.advanced-drawer[open] > summary::after {
+  content: '收起 ▴';
+}
+
+.advanced-drawer-body {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-subtle);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.progress-log-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  font-size: 12.5px;
+}
+
+.progress-log-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-secondary);
+}
+
+.progress-log-item.done {
+  color: var(--success);
+}
+
+.progress-log-item.active {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.progress-log-item.error {
+  color: var(--danger);
+}
+

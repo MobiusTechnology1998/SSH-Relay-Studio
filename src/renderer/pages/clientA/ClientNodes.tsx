@@ -306,162 +306,25 @@ export const ClientNodes: React.FC<ClientNodesProps> = ({
               </div>
             </div>
 
-            <div className="field">
-              <label className="field-label">传输引擎（跨国弱网核心优化）</label>
-              <select
-                className="select"
-                value={editing.engine ?? 'openssh'}
-                onChange={(e) =>
-                  setEditing({
-                    ...editing,
-                    engine: e.target.value as NodeProfile['engine'],
-                  })
-                }
-              >
-                <option value="openssh">
-                  OpenSSH 多隧道并行连接池（设备 B 零额外软件，兼容性最强）
-                </option>
-                <option value="hysteria2">
-                  QUIC / Hysteria 2 跨国弱网引擎（UDP 抗丢包 + Brutal 拥塞控制 + 原生 UDP，推荐高丢包跨国链路）
-                </option>
-              </select>
-            </div>
-
-            {editing.engine === 'hysteria2' && (
-              <div className="callout callout-accent stack-sm" style={{ padding: 12 }}>
-                <div style={{ fontWeight: 650, fontSize: 13 }}>
-                  QUIC (Hysteria 2) 跨国弱网加速参数（导入设备 B 配对码会自动填充）
-                </div>
-                <div className="grid-2">
-                  <div className="field">
-                    <label className="field-label">设备 B QUIC UDP 端口</label>
-                    <input
-                      className="input mono"
-                      type="number"
-                      value={editing.quicUdpPort ?? 53623}
-                      onChange={(e) =>
-                        setEditing({
-                          ...editing,
-                          quicUdpPort: Number(e.target.value) || 53623,
-                        })
-                      }
-                    />
-                  </div>
-                  <div className="field">
-                    <label className="field-label">TLS 伪装域名 (SNI)</label>
-                    <input
-                      className="input mono"
-                      value={editing.quicSni ?? 'www.bing.com'}
-                      onChange={(e) => setEditing({ ...editing, quicSni: e.target.value })}
-                      placeholder="www.bing.com"
-                    />
-                  </div>
-                </div>
-                <div className="grid-2">
-                  <div className="field">
-                    <label className="field-label">QUIC 鉴权密钥 (Auth Token)</label>
-                    <input
-                      className="input mono"
-                      value={editing.quicAuthToken ?? ''}
-                      onChange={(e) => setEditing({ ...editing, quicAuthToken: e.target.value })}
-                      placeholder="从设备 B 配对码自动导入"
-                    />
-                  </div>
-                  <div className="field">
-                    <label className="field-label">Salamander 混淆密码（可选，防 UDP QoS）</label>
-                    <input
-                      className="input mono"
-                      value={editing.quicObfsPassword ?? ''}
-                      onChange={(e) =>
-                        setEditing({ ...editing, quicObfsPassword: e.target.value })
-                      }
-                      placeholder="留空则不启用混淆"
-                    />
-                  </div>
-                </div>
-                <div className="field">
-                  <label className="field-label">服务端证书指纹 pinSHA256（防中间人攻击）</label>
-                  <input
-                    className="input mono"
-                    value={editing.quicCertPinSha256 ?? ''}
-                    onChange={(e) =>
-                      setEditing({ ...editing, quicCertPinSha256: e.target.value })
-                    }
-                    placeholder="AA:BB:CC:..."
-                  />
-                </div>
-                <div className="grid-2">
-                  <div className="field">
-                    <label className="field-label">本机上行带宽期望 (Mbps，Brutal)</label>
-                    <input
-                      className="input mono"
-                      type="number"
-                      min={5}
-                      max={2000}
-                      value={editing.quicUpMbps ?? 50}
-                      onChange={(e) =>
-                        setEditing({
-                          ...editing,
-                          quicUpMbps: Math.max(5, Number(e.target.value) || 50),
-                        })
-                      }
-                    />
-                  </div>
-                  <div className="field">
-                    <label className="field-label">本机下行带宽期望 (Mbps，Brutal)</label>
-                    <input
-                      className="input mono"
-                      type="number"
-                      min={10}
-                      max={5000}
-                      value={editing.quicDownMbps ?? 200}
-                      onChange={(e) =>
-                        setEditing({
-                          ...editing,
-                          quicDownMbps: Math.max(10, Number(e.target.value) || 200),
-                        })
-                      }
-                    />
-                  </div>
-                </div>
-                <label className="checkbox-row">
-                  <input
-                    type="checkbox"
-                    checked={editing.autoFallbackToSsh !== false}
-                    onChange={(e) =>
-                      setEditing({ ...editing, autoFallbackToSsh: e.target.checked })
-                    }
-                  />
-                  <span>UDP 被屏蔽/握手失败时，自动无缝回退至 OpenSSH 多隧道连接池（强烈推荐）</span>
-                </label>
-              </div>
-            )}
-
-            <div className="field">
-              <label className="field-label">隧道转发模式</label>
-              <select
-                className="select"
-                value={editing.mode}
-                onChange={(e) =>
-                  setEditing({
-                    ...editing,
-                    mode: e.target.value as NodeProfile['mode'],
-                    localPort: e.target.value === 'localForward' ? 7890 : 1080,
-                  })
-                }
-              >
-                <option value="socks5">
-                  标准 SOCKS5 动态加密隧道（ssh -D，推荐：设备 B 可直连外网）
-                </option>
-                <option value="localForward">
-                  本地端口转发（ssh -L，适用于设备 B 依赖 Clash/v2rayN 才能出网）
-                </option>
-              </select>
-            </div>
-
             <div className="grid-2">
               <div className="field">
-                <label className="field-label">设备 A 本地监听端口</label>
+                <label className="field-label">传输引擎</label>
+                <select
+                  className="select"
+                  value={editing.engine ?? 'openssh'}
+                  onChange={(e) =>
+                    setEditing({
+                      ...editing,
+                      engine: e.target.value as NodeProfile['engine'],
+                    })
+                  }
+                >
+                  <option value="openssh">OpenSSH 多隧道池（零额外组件）</option>
+                  <option value="hysteria2">QUIC / Hysteria 2（跨国弱网抗丢包推荐）</option>
+                </select>
+              </div>
+              <div className="field">
+                <label className="field-label">本地代理监听端口</label>
                 <input
                   className="input mono"
                   type="number"
@@ -470,194 +333,338 @@ export const ClientNodes: React.FC<ClientNodesProps> = ({
                     setEditing({ ...editing, localPort: Number(e.target.value) || 1080 })
                   }
                 />
-                <span className="field-hint">仅监听 127.0.0.1，不对外暴露</span>
+                <span className="field-hint">仅监听 127.0.0.1，默认 1080</span>
               </div>
-              {editing.mode === 'localForward' && (
+            </div>
+
+            {editing.engine === 'hysteria2' && (
+              <div className="grid-2">
                 <div className="field">
-                  <label className="field-label">设备 B 本地代理端口</label>
+                  <label className="field-label">设备 B QUIC UDP 端口</label>
                   <input
                     className="input mono"
                     type="number"
-                    value={editing.remoteProxyPort}
+                    value={editing.quicUdpPort ?? 53623}
                     onChange={(e) =>
                       setEditing({
                         ...editing,
-                        remoteProxyPort: Number(e.target.value) || 7890,
-                      })
-                    }
-                  />
-                  <span className="field-hint">如 Clash 默认 7890 / v2rayN 10809</span>
-                </div>
-              )}
-            </div>
-
-            <div className="field">
-              <label className="field-label">自定义私钥路径（留空则使用默认 ~/.ssh/id_ed25519）</label>
-              <div className="row-wrap" style={{ flexWrap: 'nowrap' }}>
-                <input
-                  className="input mono"
-                  value={editing.privateKeyPath}
-                  onChange={(e) => setEditing({ ...editing, privateKeyPath: e.target.value })}
-                  placeholder="默认 ~/.ssh/id_ed25519"
-                />
-                <button className="btn" type="button" onClick={handlePickKeyFile}>
-                  浏览
-                </button>
-              </div>
-            </div>
-
-            <div className="grid-2">
-              <div className="field">
-                <label className="field-label">心跳保活间隔 ServerAliveInterval（秒）</label>
-                <input
-                  className="input mono"
-                  type="number"
-                  min={5}
-                  max={300}
-                  value={editing.serverAliveInterval ?? 15}
-                  onChange={(e) =>
-                    setEditing({
-                      ...editing,
-                      serverAliveInterval: Math.max(5, Number(e.target.value) || 15),
-                    })
-                  }
-                />
-                <span className="field-hint">默认 15 秒，搭配 IPQoS=none 与 TCPKeepAlive=yes 防断流</span>
-              </div>
-              <div className="field">
-                <label className="field-label">心跳最大重试 ServerAliveCountMax</label>
-                <input
-                  className="input mono"
-                  type="number"
-                  min={1}
-                  max={20}
-                  value={editing.serverAliveCountMax ?? 3}
-                  onChange={(e) =>
-                    setEditing({
-                      ...editing,
-                      serverAliveCountMax: Math.max(1, Number(e.target.value) || 3),
-                    })
-                  }
-                />
-                <span className="field-hint">连续无响应此次数后自动触发重连（默认 3 次）</span>
-              </div>
-            </div>
-
-            <div className="grid-2">
-              <div className="field">
-                <label className="field-label">并行隧道连接池数（1-6，推荐 3）</label>
-                <input
-                  className="input mono"
-                  type="number"
-                  min={1}
-                  max={6}
-                  value={editing.poolSize ?? 3}
-                  onChange={(e) =>
-                    setEditing({
-                      ...editing,
-                      poolSize: Math.max(1, Math.min(6, Number(e.target.value) || 3)),
-                    })
-                  }
-                />
-                <span className="field-hint">
-                  并行建立多条 SSH 通道并本地智能调度，缓解跨国弱网单 TCP 队头阻塞与断线卡顿
-                </span>
-              </div>
-              <div className="field">
-                <label className="field-label">定时无感轮换周期（分钟，0 为关闭）</label>
-                <input
-                  className="input mono"
-                  type="number"
-                  min={0}
-                  max={1440}
-                  value={editing.rotationIntervalMin ?? 0}
-                  onChange={(e) =>
-                    setEditing({
-                      ...editing,
-                      rotationIntervalMin: Math.max(
-                        0,
-                        Math.min(1440, Number(e.target.value) || 0)
-                      ),
-                    })
-                  }
-                />
-                <span className="field-hint">
-                  按周期先建新线再排空旧线，可规避运营商长连接限速（建议 120-240 分钟或 0 关闭）
-                </span>
-              </div>
-            </div>
-
-            <label className="checkbox-row">
-              <input
-                type="checkbox"
-                checked={editing.preferFastCipher !== false}
-                onChange={(e) => setEditing({ ...editing, preferFastCipher: e.target.checked })}
-              />
-              <span>优先高速加密套件（AES-128-GCM / ChaCha20，利用 AES-NI 硬件加速提速）</span>
-            </label>
-
-            <label className="checkbox-row">
-              <input
-                type="checkbox"
-                checked={editing.forceIpv4 !== false}
-                onChange={(e) => setEditing({ ...editing, forceIpv4: e.target.checked })}
-              />
-              <span>强制使用 IPv4（AddressFamily=inet，避免跨国链路 IPv6 绕路与回退卡顿）</span>
-            </label>
-
-            <div className="grid-2">
-              <div className="field" style={{ justifyContent: 'center' }}>
-                <label className="checkbox-row">
-                  <input
-                    type="checkbox"
-                    checked={editing.healthCheckEnabled !== false}
-                    onChange={(e) =>
-                      setEditing({ ...editing, healthCheckEnabled: e.target.checked })
-                    }
-                  />
-                  <span>启用端到端主动探活（自动检测假死并重建）</span>
-                </label>
-              </div>
-              {editing.healthCheckEnabled !== false && (
-                <div className="field">
-                  <label className="field-label">探活周期（秒，默认 25）</label>
-                  <input
-                    className="input mono"
-                    type="number"
-                    min={10}
-                    max={120}
-                    value={editing.healthCheckIntervalSec ?? 25}
-                    onChange={(e) =>
-                      setEditing({
-                        ...editing,
-                        healthCheckIntervalSec: Math.max(
-                          10,
-                          Math.min(120, Number(e.target.value) || 25)
-                        ),
+                        quicUdpPort: Number(e.target.value) || 53623,
                       })
                     }
                   />
                 </div>
-              )}
-            </div>
-
-            <label className="checkbox-row">
-              <input
-                type="checkbox"
-                checked={Boolean(editing.compression)}
-                onChange={(e) => setEditing({ ...editing, compression: e.target.checked })}
-              />
-              <span>启用 SSH 压缩（-C，日常浏览 HTTPS 网页建议保持关闭以降低抖动与延迟）</span>
-            </label>
-
-            {editing.host.trim() && (
-              <div className="field">
-                <label className="field-label">将执行的 SSH 命令预览</label>
-                <div className="code-block" style={{ fontSize: 11.5 }}>
-                  {formatSshCommandPreview(editing)}
+                <div className="field">
+                  <label className="field-label">QUIC 鉴权密钥 (Auth Token)</label>
+                  <input
+                    className="input mono"
+                    value={editing.quicAuthToken ?? ''}
+                    onChange={(e) => setEditing({ ...editing, quicAuthToken: e.target.value })}
+                    placeholder="从设备 B 配对码自动导入"
+                  />
                 </div>
               </div>
             )}
+
+            <details className="advanced-drawer">
+              <summary>
+                <span>高级弱网与协议参数（已自动设为跨国最优值）</span>
+                <span className="mono" style={{ fontSize: 11.5, color: 'var(--text-muted)' }}>
+                  {editing.engine === 'hysteria2'
+                    ? `Brutal ${editing.quicUpMbps ?? 50}/${editing.quicDownMbps ?? 200}M · 备选 SSH ${editing.poolSize ?? 3} 通道`
+                    : `${editing.mode === 'socks5' ? 'SOCKS5' : '本地转发'} · ${editing.poolSize ?? 3} 通道 · 心跳 ${editing.serverAliveInterval ?? 15}s`}
+                </span>
+              </summary>
+              <div className="advanced-drawer-body">
+                {editing.engine === 'hysteria2' && (
+                  <div className="callout callout-accent stack-sm" style={{ padding: 12 }}>
+                    <div style={{ fontWeight: 650, fontSize: 12.5 }}>
+                      QUIC (Hysteria 2) 进阶参数（配对码已自动填充，通常无需修改）
+                    </div>
+                    <div className="grid-2">
+                      <div className="field">
+                        <label className="field-label">TLS 伪装域名 (SNI)</label>
+                        <input
+                          className="input mono"
+                          value={editing.quicSni ?? 'www.bing.com'}
+                          onChange={(e) => setEditing({ ...editing, quicSni: e.target.value })}
+                          placeholder="www.bing.com"
+                        />
+                      </div>
+                      <div className="field">
+                        <label className="field-label">Salamander 混淆密码（可选）</label>
+                        <input
+                          className="input mono"
+                          value={editing.quicObfsPassword ?? ''}
+                          onChange={(e) =>
+                            setEditing({ ...editing, quicObfsPassword: e.target.value })
+                          }
+                          placeholder="留空则不启用混淆"
+                        />
+                      </div>
+                    </div>
+                    <div className="field">
+                      <label className="field-label">服务端证书指纹 pinSHA256（防中间人攻击）</label>
+                      <input
+                        className="input mono"
+                        value={editing.quicCertPinSha256 ?? ''}
+                        onChange={(e) =>
+                          setEditing({ ...editing, quicCertPinSha256: e.target.value })
+                        }
+                        placeholder="AA:BB:CC:..."
+                      />
+                    </div>
+                    <div className="grid-2">
+                      <div className="field">
+                        <label className="field-label">本机上行带宽期望 (Mbps，Brutal)</label>
+                        <input
+                          className="input mono"
+                          type="number"
+                          min={5}
+                          max={2000}
+                          value={editing.quicUpMbps ?? 50}
+                          onChange={(e) =>
+                            setEditing({
+                              ...editing,
+                              quicUpMbps: Math.max(5, Number(e.target.value) || 50),
+                            })
+                          }
+                        />
+                      </div>
+                      <div className="field">
+                        <label className="field-label">本机下行带宽期望 (Mbps，Brutal)</label>
+                        <input
+                          className="input mono"
+                          type="number"
+                          min={10}
+                          max={5000}
+                          value={editing.quicDownMbps ?? 200}
+                          onChange={(e) =>
+                            setEditing({
+                              ...editing,
+                              quicDownMbps: Math.max(10, Number(e.target.value) || 200),
+                            })
+                          }
+                        />
+                      </div>
+                    </div>
+                    <label className="checkbox-row">
+                      <input
+                        type="checkbox"
+                        checked={editing.autoFallbackToSsh !== false}
+                        onChange={(e) =>
+                          setEditing({ ...editing, autoFallbackToSsh: e.target.checked })
+                        }
+                      />
+                      <span>UDP 被屏蔽/握手失败时，自动无缝回退至 OpenSSH 多隧道连接池（强烈推荐）</span>
+                    </label>
+                  </div>
+                )}
+
+                <div className="field">
+                  <label className="field-label">SSH 隧道转发模式</label>
+                  <select
+                    className="select"
+                    value={editing.mode}
+                    onChange={(e) =>
+                      setEditing({
+                        ...editing,
+                        mode: e.target.value as NodeProfile['mode'],
+                        localPort: e.target.value === 'localForward' ? 7890 : 1080,
+                      })
+                    }
+                  >
+                    <option value="socks5">
+                      标准 SOCKS5 动态加密隧道（ssh -D，推荐：设备 B 可直连外网）
+                    </option>
+                    <option value="localForward">
+                      本地端口转发（ssh -L，适用于设备 B 依赖 Clash/v2rayN 才能出网）
+                    </option>
+                  </select>
+                </div>
+
+                {editing.mode === 'localForward' && (
+                  <div className="field">
+                    <label className="field-label">设备 B 本地代理端口</label>
+                    <input
+                      className="input mono"
+                      type="number"
+                      value={editing.remoteProxyPort}
+                      onChange={(e) =>
+                        setEditing({
+                          ...editing,
+                          remoteProxyPort: Number(e.target.value) || 7890,
+                        })
+                      }
+                    />
+                    <span className="field-hint">如 Clash 默认 7890 / v2rayN 10809</span>
+                  </div>
+                )}
+
+                <div className="field">
+                  <label className="field-label">自定义私钥路径（留空则使用默认 ~/.ssh/id_ed25519）</label>
+                  <div className="row-wrap" style={{ flexWrap: 'nowrap' }}>
+                    <input
+                      className="input mono"
+                      value={editing.privateKeyPath}
+                      onChange={(e) => setEditing({ ...editing, privateKeyPath: e.target.value })}
+                      placeholder="默认 ~/.ssh/id_ed25519"
+                    />
+                    <button className="btn" type="button" onClick={handlePickKeyFile}>
+                      浏览
+                    </button>
+                  </div>
+                </div>
+
+                <div className="grid-2">
+                  <div className="field">
+                    <label className="field-label">心跳保活间隔 ServerAliveInterval（秒）</label>
+                    <input
+                      className="input mono"
+                      type="number"
+                      min={5}
+                      max={300}
+                      value={editing.serverAliveInterval ?? 15}
+                      onChange={(e) =>
+                        setEditing({
+                          ...editing,
+                          serverAliveInterval: Math.max(5, Number(e.target.value) || 15),
+                        })
+                      }
+                    />
+                    <span className="field-hint">默认 15 秒，搭配 IPQoS=none 与 TCPKeepAlive=yes</span>
+                  </div>
+                  <div className="field">
+                    <label className="field-label">心跳最大重试 ServerAliveCountMax</label>
+                    <input
+                      className="input mono"
+                      type="number"
+                      min={1}
+                      max={20}
+                      value={editing.serverAliveCountMax ?? 3}
+                      onChange={(e) =>
+                        setEditing({
+                          ...editing,
+                          serverAliveCountMax: Math.max(1, Number(e.target.value) || 3),
+                        })
+                      }
+                    />
+                    <span className="field-hint">连续无响应此次数后自动触发重连（默认 3 次）</span>
+                  </div>
+                </div>
+
+                <div className="grid-2">
+                  <div className="field">
+                    <label className="field-label">并行隧道连接池数（1-6，推荐 3）</label>
+                    <input
+                      className="input mono"
+                      type="number"
+                      min={1}
+                      max={6}
+                      value={editing.poolSize ?? 3}
+                      onChange={(e) =>
+                        setEditing({
+                          ...editing,
+                          poolSize: Math.max(1, Math.min(6, Number(e.target.value) || 3)),
+                        })
+                      }
+                    />
+                  </div>
+                  <div className="field">
+                    <label className="field-label">定时无感轮换周期（分钟，0 为关闭）</label>
+                    <input
+                      className="input mono"
+                      type="number"
+                      min={0}
+                      max={1440}
+                      value={editing.rotationIntervalMin ?? 0}
+                      onChange={(e) =>
+                        setEditing({
+                          ...editing,
+                          rotationIntervalMin: Math.max(
+                            0,
+                            Math.min(1440, Number(e.target.value) || 0)
+                          ),
+                        })
+                      }
+                    />
+                  </div>
+                </div>
+
+                <label className="checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={editing.preferFastCipher !== false}
+                    onChange={(e) =>
+                      setEditing({ ...editing, preferFastCipher: e.target.checked })
+                    }
+                  />
+                  <span>优先高速加密套件（AES-128-GCM / ChaCha20，利用 AES-NI 硬件加速）</span>
+                </label>
+
+                <label className="checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={editing.forceIpv4 !== false}
+                    onChange={(e) => setEditing({ ...editing, forceIpv4: e.target.checked })}
+                  />
+                  <span>强制使用 IPv4（AddressFamily=inet，避免跨国链路 IPv6 绕路）</span>
+                </label>
+
+                <div className="grid-2">
+                  <div className="field" style={{ justifyContent: 'center' }}>
+                    <label className="checkbox-row">
+                      <input
+                        type="checkbox"
+                        checked={editing.healthCheckEnabled !== false}
+                        onChange={(e) =>
+                          setEditing({ ...editing, healthCheckEnabled: e.target.checked })
+                        }
+                      />
+                      <span>启用端到端主动探活</span>
+                    </label>
+                  </div>
+                  {editing.healthCheckEnabled !== false && (
+                    <div className="field">
+                      <label className="field-label">探活周期（秒，默认 25）</label>
+                      <input
+                        className="input mono"
+                        type="number"
+                        min={10}
+                        max={120}
+                        value={editing.healthCheckIntervalSec ?? 25}
+                        onChange={(e) =>
+                          setEditing({
+                            ...editing,
+                            healthCheckIntervalSec: Math.max(
+                              10,
+                              Math.min(120, Number(e.target.value) || 25)
+                            ),
+                          })
+                        }
+                      />
+                    </div>
+                  )}
+                </div>
+
+                <label className="checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(editing.compression)}
+                    onChange={(e) => setEditing({ ...editing, compression: e.target.checked })}
+                  />
+                  <span>启用 SSH 压缩（-C，日常浏览 HTTPS 建议保持关闭）</span>
+                </label>
+
+                {editing.host.trim() && (
+                  <div className="field">
+                    <label className="field-label">将执行的 SSH 命令预览</label>
+                    <div className="code-block" style={{ fontSize: 11.5 }}>
+                      {formatSshCommandPreview(editing)}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </details>
           </>
         )}
       </Modal>
