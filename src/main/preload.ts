@@ -42,6 +42,7 @@ export interface RelayApi {
   startTunnel: (nodeId?: string) => Promise<ActionResult<TunnelStatus>>;
   stopTunnel: () => Promise<ActionResult<TunnelStatus>>;
   reconnectTunnel: () => Promise<ActionResult<TunnelStatus>>;
+  rotateTunnelPool: () => Promise<ActionResult<TunnelStatus>>;
   killOrphanSsh: () => Promise<ActionResult>;
   onTunnelStatus: (cb: (status: TunnelStatus) => void) => () => void;
 
@@ -109,6 +110,7 @@ const api: RelayApi = {
   startTunnel: (nodeId) => ipcRenderer.invoke('clientA:startTunnel', nodeId),
   stopTunnel: () => ipcRenderer.invoke('clientA:stopTunnel'),
   reconnectTunnel: () => ipcRenderer.invoke('clientA:reconnectTunnel'),
+  rotateTunnelPool: () => ipcRenderer.invoke('clientA:rotatePool'),
   killOrphanSsh: () => ipcRenderer.invoke('clientA:killOrphanSsh'),
   onTunnelStatus: (cb) => {
     const handler = (_event: Electron.IpcRendererEvent, status: TunnelStatus) => cb(status);

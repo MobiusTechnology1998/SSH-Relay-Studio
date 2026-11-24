@@ -47,6 +47,12 @@ const DEFAULT_TUNNEL_STATUS: TunnelStatus = {
   nextRetryAt: null,
   lastHealthCheckAt: null,
   lastHealthLatencyMs: null,
+  poolSize: 3,
+  healthyWorkers: 0,
+  activeConnections: 0,
+  totalBytesUp: 0,
+  totalBytesDown: 0,
+  workers: [],
   lastError: null,
   diagnosticHint: null,
 };

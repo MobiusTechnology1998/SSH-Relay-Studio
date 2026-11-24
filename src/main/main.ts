@@ -117,7 +117,7 @@ function updateTrayUI(): void {
   const stateLabelMap: Record<TunnelStatus['state'], string> = {
     disconnected: '未连接',
     connecting: '连接中...',
-    connected: `已连接 (127.0.0.1:${status.localPort})`,
+    connected: `已连接 (${status.healthyWorkers}/${status.poolSize} 通道 · :${status.localPort})`,
     reconnecting: `自动重连中 (#${status.reconnectCount})`,
     error: '连接异常',
   };
@@ -156,6 +156,13 @@ function updateTrayUI(): void {
           } else if (activeNode) {
             await tunnelManager.start(activeNode);
           }
+        },
+      },
+      {
+        label: '无感平滑热轮换',
+        enabled: status.state === 'connected',
+        click: async () => {
+          await tunnelManager.rotateAllGracefully();
         },
       },
       {
@@ -346,6 +353,7 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle('clientA:stopTunnel', () => tunnelManager.stop());
   ipcMain.handle('clientA:reconnectTunnel', () => tunnelManager.reconnectNow());
+  ipcMain.handle('clientA:rotatePool', () => tunnelManager.rotateAllGracefully());
   ipcMain.handle('clientA:killOrphanSsh', () => tunnelManager.killOrphanSshProcesses());
 
   // ===== Client A: Keys & Security =====

@@ -23,6 +23,18 @@ function formatDuration(sinceMs: number | null, nowMs: number): string {
   return `${pad(h)}:${pad(m)}:${pad(s)}`;
 }
 
+function formatBytes(bytes: number): string {
+  if (!bytes || bytes <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let val = bytes;
+  let idx = 0;
+  while (val >= 1024 && idx < units.length - 1) {
+    val /= 1024;
+    idx += 1;
+  }
+  return `${val >= 100 || idx === 0 ? val.toFixed(0) : val.toFixed(1)} ${units[idx]}`;
+}
+
 export const ClientDashboard: React.FC<ClientDashboardProps> = ({
   settings,
   tunnelStatus,
@@ -52,8 +64,11 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
 
   const statusMeta = {
     disconnected: { label: '隧道未连接', badge: 'neutral' as const },
-    connecting: { label: '正在建立 SSH 隧道...', badge: 'warn' as const },
-    connected: { label: '加密隧道运行中', badge: 'success' as const },
+    connecting: { label: '正在建立并行 SSH 隧道池...', badge: 'warn' as const },
+    connected: {
+      label: `并行隧道运行中（${tunnelStatus.healthyWorkers}/${tunnelStatus.poolSize} 通道健康）`,
+      badge: 'success' as const,
+    },
     reconnecting: {
       label:
         retryCountdownSec !== null && retryCountdownSec > 0
@@ -94,6 +109,16 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
     }
   };
 
+  const handleRotatePool = async () => {
+    setBusy(true);
+    try {
+      const res = await window.relayApi.rotateTunnelPool();
+      onNotify(res.ok ? 'success' : 'error', res.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const handleLaunchBrowser = async () => {
     if (!activeNode) {
       onNotify('warn', '请先选择中转节点');
@@ -128,7 +153,7 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
         <div>
           <h1 className="page-title">隧道控制台</h1>
           <p className="page-desc">
-            一键管理加密隧道与弱网自愈守护（主动假死探活、休眠唤醒恢复、1s 起步指数退避重连）
+            多隧道并行连接池 + 本地最少连接/低延迟调度器，缓解跨国弱网单 TCP 队头阻塞并实现断线无感故障转移
           </p>
         </div>
         <div className="header-actions">
@@ -178,14 +203,24 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
         </div>
 
         <div className="row-wrap" style={{ flexShrink: 0 }}>
+          {tunnelStatus.state === 'connected' && (
+            <button
+              className="btn btn-lg"
+              onClick={handleRotatePool}
+              disabled={busy}
+              title="先建立新通道再优雅排空旧通道，业务不断流"
+            >
+              <IconRefresh size={16} />
+              无感轮换
+            </button>
+          )}
           {isRunning && (
             <button
               className="btn btn-lg"
               onClick={handleReconnect}
               disabled={busy}
-              title="休眠唤醒后立即重建连接"
+              title="强制断开并重建全部连接"
             >
-              <IconRefresh size={16} />
               立即重连
             </button>
           )}
@@ -221,14 +256,16 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
       {/* Live Metrics */}
       <div className="grid-4">
         <div className="metric-tile">
-          <div className="metric-label">本地代理地址</div>
+          <div className="metric-label">并行连接池 / 活跃流</div>
           <div className="metric-value">
-            127.0.0.1:{activeNode?.localPort ?? 1080}
+            {tunnelStatus.healthyWorkers}/{tunnelStatus.poolSize} · {tunnelStatus.activeConnections} 连接
           </div>
           <div className="metric-sub">
+            127.0.0.1:{activeNode?.localPort ?? 1080} (
             {activeNode?.mode === 'localForward'
-              ? `转发至 B 端 :${activeNode.remoteProxyPort}`
-              : 'SOCKS5 动态隧道 (-D)'}
+              ? `转发 :${activeNode.remoteProxyPort}`
+              : 'SOCKS5 调度'}
+            )
           </div>
         </div>
         <div className="metric-tile">
@@ -237,18 +274,19 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
             {formatDuration(tunnelStatus.connectedSince, now)}
           </div>
           <div className="metric-sub">
-            心跳保活：{aliveInterval}s × {aliveCountMax}
+            心跳：{aliveInterval}s × {aliveCountMax} · 重连 {tunnelStatus.reconnectCount} 次
           </div>
         </div>
         <div className="metric-tile">
-          <div className="metric-label">隧道端到端延迟</div>
+          <div className="metric-label">最优通道延迟</div>
           <div className="metric-value">
             {tunnelStatus.lastHealthLatencyMs !== null
               ? `${tunnelStatus.lastHealthLatencyMs} ms`
               : '--'}
           </div>
           <div className="metric-sub">
-            PID: {tunnelStatus.pid ?? '--'} · 重连: {tunnelStatus.reconnectCount} 次
+            上行 {formatBytes(tunnelStatus.totalBytesUp)} · 下行{' '}
+            {formatBytes(tunnelStatus.totalBytesDown)}
           </div>
         </div>
         <div className="metric-tile">
@@ -267,6 +305,60 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
           </div>
         </div>
       </div>
+
+      {/* Per-worker Multi-Tunnel Pool Telemetry */}
+      {tunnelStatus.workers.length > 0 && (
+        <div className="card stack-sm">
+          <div className="row-between">
+            <div>
+              <h3 className="card-title">多隧道连接池实时状态（最少连接 + 低延迟优先调度）</h3>
+              <p className="card-subtitle">
+                单条通道出现跨国丢包或假死时会自动摘除并后台重建，其余健康通道零感知接管流量
+              </p>
+            </div>
+            <StatusBadge
+              variant={tunnelStatus.healthyWorkers > 0 ? 'success' : 'warn'}
+              label={`健康 ${tunnelStatus.healthyWorkers}/${tunnelStatus.poolSize}`}
+            />
+          </div>
+          <div className="grid-3">
+            {tunnelStatus.workers.map((w) => {
+              const badgeVariant =
+                w.state === 'healthy'
+                  ? 'success'
+                  : w.state === 'draining'
+                  ? 'accent'
+                  : w.state === 'stopped'
+                  ? 'neutral'
+                  : 'warn';
+              const stateText =
+                w.state === 'healthy'
+                  ? '健康'
+                  : w.state === 'starting'
+                  ? '建连中'
+                  : w.state === 'reconnecting'
+                  ? `重连中 (#${w.reconnectCount})`
+                  : w.state === 'draining'
+                  ? '排空下线'
+                  : '已停止';
+              return (
+                <div key={w.id} className="metric-tile">
+                  <div className="row-between">
+                    <span className="metric-label">通道 #{w.slotIndex + 1}</span>
+                    <StatusBadge variant={badgeVariant} label={stateText} />
+                  </div>
+                  <div className="metric-value" style={{ fontSize: 14, marginTop: 6 }}>
+                    {w.latencyMs !== null ? `${w.latencyMs} ms` : '-- ms'} · {w.activeConnections} 连接
+                  </div>
+                  <div className="metric-sub mono">
+                    127.0.0.1:{w.internalPort} · PID {w.pid ?? '--'}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {/* Quick Node Selector & Preferences */}
       <div className="grid-2">

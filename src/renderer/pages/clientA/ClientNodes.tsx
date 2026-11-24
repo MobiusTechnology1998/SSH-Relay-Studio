@@ -29,6 +29,8 @@ function createEmptyNode(): NodeProfile {
     preferFastCipher: true,
     healthCheckEnabled: true,
     healthCheckIntervalSec: 25,
+    poolSize: 3,
+    rotationIntervalMin: 0,
     notes: '',
   };
 }
@@ -179,8 +181,8 @@ export const ClientNodes: React.FC<ClientNodesProps> = ({
                       dot={false}
                       label={
                         node.mode === 'socks5'
-                          ? `SOCKS5 :${node.localPort}`
-                          : `端口转发 :${node.localPort} → B:${node.remoteProxyPort}`
+                          ? `SOCKS5 :${node.localPort} · ${node.poolSize ?? 3} 通道`
+                          : `端口转发 :${node.localPort} → B:${node.remoteProxyPort} · ${node.poolSize ?? 3} 通道`
                       }
                     />
                   </div>
@@ -380,6 +382,50 @@ export const ClientNodes: React.FC<ClientNodesProps> = ({
                   }
                 />
                 <span className="field-hint">连续无响应此次数后自动触发重连（默认 3 次）</span>
+              </div>
+            </div>
+
+            <div className="grid-2">
+              <div className="field">
+                <label className="field-label">并行隧道连接池数（1-6，推荐 3）</label>
+                <input
+                  className="input mono"
+                  type="number"
+                  min={1}
+                  max={6}
+                  value={editing.poolSize ?? 3}
+                  onChange={(e) =>
+                    setEditing({
+                      ...editing,
+                      poolSize: Math.max(1, Math.min(6, Number(e.target.value) || 3)),
+                    })
+                  }
+                />
+                <span className="field-hint">
+                  并行建立多条 SSH 通道并本地智能调度，缓解跨国弱网单 TCP 队头阻塞与断线卡顿
+                </span>
+              </div>
+              <div className="field">
+                <label className="field-label">定时无感轮换周期（分钟，0 为关闭）</label>
+                <input
+                  className="input mono"
+                  type="number"
+                  min={0}
+                  max={1440}
+                  value={editing.rotationIntervalMin ?? 0}
+                  onChange={(e) =>
+                    setEditing({
+                      ...editing,
+                      rotationIntervalMin: Math.max(
+                        0,
+                        Math.min(1440, Number(e.target.value) || 0)
+                      ),
+                    })
+                  }
+                />
+                <span className="field-hint">
+                  按周期先建新线再排空旧线，可规避运营商长连接限速（建议 120-240 分钟或 0 关闭）
+                </span>
               </div>
             </div>
 

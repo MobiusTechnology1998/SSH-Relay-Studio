@@ -20,6 +20,8 @@ export interface NodeProfile {
   preferFastCipher?: boolean; // Default true: prioritize AES-GCM / ChaCha20 hardware-accelerated ciphers
   healthCheckEnabled?: boolean; // Default true: active end-to-end tunnel liveness probe
   healthCheckIntervalSec?: number; // Default 25 seconds
+  poolSize?: number; // Default 3 (1-6): parallel SSH tunnels behind local balancer to mitigate TCP HOL blocking
+  rotationIntervalMin?: number; // Default 0 (disabled): periodic Make-Before-Break worker rotation in minutes
   notes?: string;
 }
 
@@ -54,6 +56,17 @@ export type TunnelStatusState =
   | 'reconnecting'
   | 'error';
 
+export interface TunnelWorkerSummary {
+  id: string;
+  slotIndex: number;
+  internalPort: number;
+  pid: number | null;
+  state: 'starting' | 'healthy' | 'reconnecting' | 'draining' | 'stopped';
+  latencyMs: number | null;
+  activeConnections: number;
+  reconnectCount: number;
+}
+
 export interface TunnelStatus {
   state: TunnelStatusState;
   nodeId: string | null;
@@ -66,6 +79,12 @@ export interface TunnelStatus {
   nextRetryAt: number | null;
   lastHealthCheckAt: number | null;
   lastHealthLatencyMs: number | null;
+  poolSize: number;
+  healthyWorkers: number;
+  activeConnections: number;
+  totalBytesUp: number;
+  totalBytesDown: number;
+  workers: TunnelWorkerSummary[];
   lastError: string | null;
   diagnosticHint: string | null;
 }

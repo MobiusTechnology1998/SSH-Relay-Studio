@@ -9,7 +9,12 @@ import {
   isHardSshAuthFailure,
   isNonFatalChannelOpenError,
 } from '../../shared/commandBuilders';
-import type { ActionResult, NodeProfile, TunnelStatus } from '../../shared/types';
+import type {
+  ActionResult,
+  NodeProfile,
+  TunnelStatus,
+  TunnelWorkerSummary,
+} from '../../shared/types';
 import { logger } from '../logger';
 import {
   execCmd,
@@ -19,26 +24,51 @@ import {
   testTcpConnection,
 } from '../platform/shell';
 import { probeTunnelHealth } from './healthProbe';
+import { findFreeLocalPort, LocalProxyBalancer } from './localProxyBalancer';
 
 type StatusListener = (status: TunnelStatus) => void;
 
 const STABLE_RESET_MS = 60_000;
 const HEALTH_PROBE_TIMEOUT_MS = 8000;
 const HEALTH_FAIL_THRESHOLD = 2;
+const WORKER_STAGGER_MS = 350;
+const DRAIN_MAX_WAIT_MS = 30_000;
+
+interface PoolWorker {
+  id: string;
+  slotIndex: number;
+  internalPort: number;
+  child: ChildProcess | null;
+  state: TunnelWorkerSummary['state'];
+  latencyMs: number | null;
+  reconnectCount: number;
+  nextRetryAt: number | null;
+  consecutiveHealthFailures: number;
+  healthCheckInFlight: boolean;
+  stderrBuffer: string;
+  isRotationCandidate: boolean;
+  replacingWorkerId: string | null;
+  listenPollTimer: NodeJS.Timeout | null;
+  healthCheckTimer: NodeJS.Timeout | null;
+  reconnectTimer: NodeJS.Timeout | null;
+  stableResetTimer: NodeJS.Timeout | null;
+  drainTimer: NodeJS.Timeout | null;
+}
 
 class TunnelManager {
-  private child: ChildProcess | null = null;
-  private reconnectTimer: NodeJS.Timeout | null = null;
-  private listenPollTimer: NodeJS.Timeout | null = null;
-  private healthCheckTimer: NodeJS.Timeout | null = null;
-  private stableResetTimer: NodeJS.Timeout | null = null;
+  private balancer: LocalProxyBalancer;
+  private workers = new Map<string, PoolWorker>();
+  private staggerTimers: NodeJS.Timeout[] = [];
+  private metricsTimer: NodeJS.Timeout | null = null;
+  private rotationTimer: NodeJS.Timeout | null = null;
   private resumeProbeTimer: NodeJS.Timeout | null = null;
-  private healthCheckInFlight = false;
-  private consecutiveHealthFailures = 0;
   private desiredRunning = false;
   private activeNode: NodeProfile | null = null;
+  private sessionEpoch = 0;
+  private workerSeq = 0;
+  private rotationCursor = 0;
   private listeners = new Set<StatusListener>();
-  private stderrBuffer = '';
+  private lastMetricsFingerprint = '';
 
   private status: TunnelStatus = {
     state: 'disconnected',
@@ -52,12 +82,35 @@ class TunnelManager {
     nextRetryAt: null,
     lastHealthCheckAt: null,
     lastHealthLatencyMs: null,
+    poolSize: 1,
+    healthyWorkers: 0,
+    activeConnections: 0,
+    totalBytesUp: 0,
+    totalBytesDown: 0,
+    workers: [],
     lastError: null,
     diagnosticHint: null,
   };
 
+  constructor() {
+    this.balancer = new LocalProxyBalancer({
+      onBackendDialError: (backendId, err) => {
+        const w = this.workers.get(backendId);
+        if (!w || w.state !== 'healthy') return;
+        logger.warn(
+          'tunnel',
+          `通道 #${w.slotIndex + 1} 本地拨号失败（${err.message}），已自动无感切换至其他健康通道并触发探活`
+        );
+        void this.probeWorkerNow(w, this.sessionEpoch);
+      },
+    });
+  }
+
   public getStatus(): TunnelStatus {
-    return { ...this.status };
+    return {
+      ...this.status,
+      workers: this.status.workers.map((w) => ({ ...w })),
+    };
   }
 
   public subscribe(listener: StatusListener): () => void {
@@ -79,29 +132,12 @@ class TunnelManager {
     }
   }
 
-  private clearTimers(): void {
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
+  private resolvePoolSize(node: NodeProfile): number {
+    const raw = node.poolSize;
+    if (typeof raw === 'number' && Number.isFinite(raw)) {
+      return Math.max(1, Math.min(6, Math.round(raw)));
     }
-    if (this.listenPollTimer) {
-      clearInterval(this.listenPollTimer);
-      this.listenPollTimer = null;
-    }
-    if (this.healthCheckTimer) {
-      clearInterval(this.healthCheckTimer);
-      this.healthCheckTimer = null;
-    }
-    if (this.stableResetTimer) {
-      clearTimeout(this.stableResetTimer);
-      this.stableResetTimer = null;
-    }
-    if (this.resumeProbeTimer) {
-      clearTimeout(this.resumeProbeTimer);
-      this.resumeProbeTimer = null;
-    }
-    this.healthCheckInFlight = false;
-    this.consecutiveHealthFailures = 0;
+    return 3;
   }
 
   private resolveKeyPath(node: NodeProfile): string {
@@ -109,6 +145,50 @@ class TunnelManager {
       return node.privateKeyPath.trim();
     }
     return path.join(os.homedir(), '.ssh', 'id_ed25519');
+  }
+
+  private clearWorkerTimers(w: PoolWorker): void {
+    if (w.listenPollTimer) {
+      clearInterval(w.listenPollTimer);
+      w.listenPollTimer = null;
+    }
+    if (w.healthCheckTimer) {
+      clearInterval(w.healthCheckTimer);
+      w.healthCheckTimer = null;
+    }
+    if (w.reconnectTimer) {
+      clearTimeout(w.reconnectTimer);
+      w.reconnectTimer = null;
+    }
+    if (w.stableResetTimer) {
+      clearTimeout(w.stableResetTimer);
+      w.stableResetTimer = null;
+    }
+    if (w.drainTimer) {
+      clearInterval(w.drainTimer);
+      w.drainTimer = null;
+    }
+    w.healthCheckInFlight = false;
+  }
+
+  private clearGlobalTimers(): void {
+    for (const t of this.staggerTimers) {
+      clearTimeout(t);
+    }
+    this.staggerTimers = [];
+
+    if (this.metricsTimer) {
+      clearInterval(this.metricsTimer);
+      this.metricsTimer = null;
+    }
+    if (this.rotationTimer) {
+      clearInterval(this.rotationTimer);
+      this.rotationTimer = null;
+    }
+    if (this.resumeProbeTimer) {
+      clearTimeout(this.resumeProbeTimer);
+      this.resumeProbeTimer = null;
+    }
   }
 
   private async killChildProcess(child: ChildProcess | null): Promise<void> {
@@ -128,13 +208,79 @@ class TunnelManager {
     }
   }
 
+  private syncAggregateStatus(extra?: Partial<TunnelStatus>): void {
+    const node = this.activeNode;
+    const stats = this.balancer.getStats();
+    const workerList: TunnelWorkerSummary[] = Array.from(this.workers.values())
+      .sort((a, b) => a.slotIndex - b.slotIndex)
+      .map((w) => ({
+        id: w.id,
+        slotIndex: w.slotIndex,
+        internalPort: w.internalPort,
+        pid: w.child?.pid ?? null,
+        state: w.state,
+        latencyMs: w.latencyMs,
+        activeConnections: stats.perBackendActive[w.id] ?? 0,
+        reconnectCount: w.reconnectCount,
+      }));
+
+    const healthyList = workerList.filter((w) => w.state === 'healthy');
+    const healthyCount = healthyList.length;
+    const primaryHealthy = healthyList[0] ?? workerList.find((w) => w.pid !== null) ?? null;
+
+    const latencies = healthyList
+      .map((w) => w.latencyMs)
+      .filter((ms): ms is number => ms !== null);
+    const bestLatencyMs = latencies.length > 0 ? Math.min(...latencies) : null;
+
+    const retryTimes = Array.from(this.workers.values())
+      .map((w) => w.nextRetryAt)
+      .filter((t): t is number => t !== null);
+    const soonestRetryAt = retryTimes.length > 0 ? Math.min(...retryTimes) : null;
+
+    const totalReconnects = workerList.reduce((sum, w) => sum + w.reconnectCount, 0);
+
+    let nextState = this.status.state;
+    if (extra?.state) {
+      nextState = extra.state;
+    } else if (!this.desiredRunning) {
+      nextState = this.status.state === 'error' ? 'error' : 'disconnected';
+    } else if (healthyCount > 0) {
+      nextState = 'connected';
+    } else if (workerList.some((w) => w.state === 'reconnecting')) {
+      nextState = 'reconnecting';
+    } else {
+      nextState = 'connecting';
+    }
+
+    const connectedSince =
+      nextState === 'connected' ? (this.status.connectedSince ?? Date.now()) : null;
+
+    this.emit({
+      state: nextState,
+      pid: primaryHealthy?.pid ?? null,
+      connectedSince,
+      reconnectCount: totalReconnects,
+      nextRetryAt: nextState === 'reconnecting' ? soonestRetryAt : null,
+      lastHealthLatencyMs: bestLatencyMs,
+      poolSize: node ? this.resolvePoolSize(node) : 1,
+      healthyWorkers: healthyCount,
+      activeConnections: stats.activeConnections,
+      totalBytesUp: stats.totalBytesUp,
+      totalBytesDown: stats.totalBytesDown,
+      workers: workerList,
+      ...(nextState === 'connected' ? { lastError: null, diagnosticHint: null } : {}),
+      ...extra,
+    });
+  }
+
   public async start(node: NodeProfile): Promise<ActionResult<TunnelStatus>> {
     if (!node.host.trim()) {
       return { ok: false, message: '节点主机地址不能为空' };
     }
 
-    // Stop any previous tunnel cleanly
-    if (this.desiredRunning || this.child) {
+    // Stop any previous pool cleanly
+    if (this.desiredRunning || this.workers.size > 0) {
       await this.stop(true);
     }
 
@@ -154,14 +300,42 @@ class TunnelManager {
         nextRetryAt: null,
         lastHealthCheckAt: null,
         lastHealthLatencyMs: null,
+        poolSize: this.resolvePoolSize(node),
+        healthyWorkers: 0,
+        activeConnections: 0,
+        totalBytesUp: 0,
+        totalBytesDown: 0,
+        workers: [],
         lastError: msg,
         diagnosticHint: '可点击「清理残留 ssh.exe」按钮，或在节点配置中修改本地端口（如 1081）。',
       });
       return { ok: false, message: msg, data: this.getStatus() };
     }
 
+    try {
+      await this.balancer.start(node.localPort);
+    } catch (err) {
+      const msg = `本地代理调度器无法监听 127.0.0.1:${node.localPort}: ${(err as Error).message}`;
+      logger.error('tunnel', msg);
+      this.emit({
+        state: 'error',
+        nodeId: node.id,
+        nodeName: node.name,
+        mode: node.mode,
+        localPort: node.localPort,
+        lastError: msg,
+        diagnosticHint: '请确认本地端口未被占用，或更换本地代理端口（如 1081）。',
+      });
+      return { ok: false, message: msg, data: this.getStatus() };
+    }
+
+    const poolSize = this.resolvePoolSize(node);
+    const epoch = ++this.sessionEpoch;
     this.desiredRunning = true;
     this.activeNode = { ...node };
+    this.rotationCursor = 0;
+    this.lastMetricsFingerprint = '';
+
     this.emit({
       state: 'connecting',
       nodeId: node.id,
@@ -174,89 +348,132 @@ class TunnelManager {
       nextRetryAt: null,
       lastHealthCheckAt: null,
       lastHealthLatencyMs: null,
+      poolSize,
+      healthyWorkers: 0,
+      activeConnections: 0,
+      totalBytesUp: 0,
+      totalBytesDown: 0,
+      workers: [],
       lastError: null,
       diagnosticHint: null,
     });
 
-    this.spawnTunnelProcess(false);
-    return { ok: true, message: `正在启动隧道：${node.name}`, data: this.getStatus() };
+    logger.info(
+      'tunnel',
+      `启动多隧道连接池 (${poolSize} 条并行通道) -> 本地入口 127.0.0.1:${node.localPort} (${node.mode === 'socks5' ? 'SOCKS5' : 'HTTP/本地转发'})`
+    );
+
+    // Stagger worker startup to avoid hitting Device B MaxStartups burst limits
+    for (let slot = 0; slot < poolSize; slot++) {
+      const timer = setTimeout(() => {
+        if (!this.desiredRunning || epoch !== this.sessionEpoch) return;
+        void this.launchWorkerForSlot(slot, epoch, false, null);
+      }, slot * WORKER_STAGGER_MS);
+      this.staggerTimers.push(timer);
+    }
+
+    // Periodically push active connection & throughput telemetry to UI
+    this.metricsTimer = setInterval(() => {
+      if (!this.desiredRunning || epoch !== this.sessionEpoch) return;
+      const stats = this.balancer.getStats();
+      const fp = `${stats.activeConnections}:${stats.totalBytesUp}:${stats.totalBytesDown}`;
+      if (fp !== this.lastMetricsFingerprint) {
+        this.lastMetricsFingerprint = fp;
+        this.syncAggregateStatus();
+      }
+    }, 1500);
+
+    // Optional periodic Make-Before-Break smooth worker rotation
+    const rotMin =
+      typeof node.rotationIntervalMin === 'number' &&
+      Number.isFinite(node.rotationIntervalMin) &&
+      node.rotationIntervalMin >= 10
+        ? Math.round(node.rotationIntervalMin)
+        : 0;
+    if (rotMin > 0) {
+      const stepMs = Math.max(60_000, Math.round((rotMin * 60_000) / poolSize));
+      logger.info(
+        'tunnel',
+        `已启用连接池定时平滑轮换：每 ${rotMin} 分钟完成全池无感换线（单通道轮换间隔 ${Math.round(stepMs / 60_000)} 分钟）`
+      );
+      this.rotationTimer = setInterval(() => {
+        if (!this.desiredRunning || epoch !== this.sessionEpoch) return;
+        const targetSlot = this.rotationCursor % poolSize;
+        this.rotationCursor += 1;
+        void this.rotateSlotGracefully(targetSlot, epoch);
+      }, stepMs);
+    }
+
+    return {
+      ok: true,
+      message: `正在启动 ${poolSize} 通道并行隧道：${node.name}`,
+      data: this.getStatus(),
+    };
   }
 
-  private startHealthCheckLoop(child: ChildProcess, node: NodeProfile): void {
-    if (node.healthCheckEnabled === false) return;
+  private async launchWorkerForSlot(
+    slotIndex: number,
+    epoch: number,
+    isReconnect: boolean,
+    replacingWorkerId: string | null,
+    priorReconnectCount = 0
+  ): Promise<void> {
+    const node = this.activeNode;
+    if (!node || !this.desiredRunning || epoch !== this.sessionEpoch) return;
 
-    const rawSec = node.healthCheckIntervalSec;
-    const intervalSec =
-      typeof rawSec === 'number' && Number.isFinite(rawSec) && rawSec >= 10 && rawSec <= 120
-        ? Math.round(rawSec)
-        : 25;
+    let internalPort: number;
+    try {
+      internalPort = await findFreeLocalPort();
+    } catch (err) {
+      logger.error('tunnel', `通道 #${slotIndex + 1} 分配本地内部端口失败: ${(err as Error).message}`);
+      return;
+    }
 
-    this.consecutiveHealthFailures = 0;
+    if (!this.desiredRunning || epoch !== this.sessionEpoch) return;
 
-    // Run a quick initial probe after 3s so UI displays real A<->B tunnel RTT promptly
-    const runProbe = async () => {
-      if (!this.desiredRunning || this.child !== child || this.healthCheckInFlight) {
-        return;
-      }
-      this.healthCheckInFlight = true;
-      try {
-        const res = await probeTunnelHealth(
-          node.mode,
-          node.localPort,
-          node.sshPort,
-          HEALTH_PROBE_TIMEOUT_MS
-        );
-        if (!this.desiredRunning || this.child !== child) return;
-
-        if (res.ok) {
-          this.consecutiveHealthFailures = 0;
-          this.emit({
-            lastHealthCheckAt: Date.now(),
-            lastHealthLatencyMs: res.latencyMs,
-          });
-        } else {
-          this.consecutiveHealthFailures += 1;
-          logger.warn(
-            'tunnel',
-            `端到端探活失败 (${this.consecutiveHealthFailures}/${HEALTH_FAIL_THRESHOLD}): ${res.detail}`
-          );
-          if (this.consecutiveHealthFailures >= HEALTH_FAIL_THRESHOLD) {
-            logger.warn(
-              'tunnel',
-              `连续 ${HEALTH_FAIL_THRESHOLD} 次探活超时，判定隧道已假死，主动终止并触发快速重连...`
-            );
-            this.stderrBuffer = '端到端健康探活连续失败（隧道假死）';
-            await this.killChildProcess(child);
-          }
-        }
-      } finally {
-        this.healthCheckInFlight = false;
-      }
+    const workerId = `w-${slotIndex + 1}-${++this.workerSeq}`;
+    const worker: PoolWorker = {
+      id: workerId,
+      slotIndex,
+      internalPort,
+      child: null,
+      state: isReconnect ? 'reconnecting' : 'starting',
+      latencyMs: null,
+      reconnectCount: priorReconnectCount,
+      nextRetryAt: null,
+      consecutiveHealthFailures: 0,
+      healthCheckInFlight: false,
+      stderrBuffer: '',
+      isRotationCandidate: Boolean(replacingWorkerId),
+      replacingWorkerId,
+      listenPollTimer: null,
+      healthCheckTimer: null,
+      reconnectTimer: null,
+      stableResetTimer: null,
+      drainTimer: null,
     };
 
-    setTimeout(() => {
-      void runProbe();
-    }, 3000);
-
-    this.healthCheckTimer = setInterval(() => {
-      void runProbe();
-    }, intervalSec * 1000);
+    this.workers.set(workerId, worker);
+    this.spawnWorkerProcess(worker, epoch, isReconnect);
   }
 
-  private spawnTunnelProcess(isReconnect: boolean): void {
+  private spawnWorkerProcess(worker: PoolWorker, epoch: number, isReconnect: boolean): void {
     const node = this.activeNode;
-    if (!node || !this.desiredRunning) return;
+    if (!node || !this.desiredRunning || epoch !== this.sessionEpoch) return;
 
-    this.clearTimers();
-    this.stderrBuffer = '';
+    this.clearWorkerTimers(worker);
+    worker.stderrBuffer = '';
+    worker.nextRetryAt = null;
+    worker.state = isReconnect ? 'reconnecting' : 'starting';
 
     const sshBin = resolveOpenSshBinary('ssh');
     const keyPath = this.resolveKeyPath(node);
-    const args = buildSshTunnelArgs(node, keyPath);
+    const workerNode: NodeProfile = { ...node, localPort: worker.internalPort };
+    const args = buildSshTunnelArgs(workerNode, keyPath);
 
     logger.info(
       'tunnel',
-      `${isReconnect ? '[自动重连] ' : ''}启动 SSH 隧道: ${sshBin} ${args.join(' ')}`
+      `[通道 #${worker.slotIndex + 1}${worker.isRotationCandidate ? '·热轮换' : isReconnect ? '·重连' : ''}] 启动内部隧道 127.0.0.1:${worker.internalPort}`
     );
 
     let child: ChildProcess;
@@ -268,28 +485,19 @@ class TunnelManager {
     } catch (err) {
       const msg = `无法启动 ssh 进程: ${(err as Error).message}`;
       logger.error('tunnel', msg);
-      this.emit({
-        state: 'error',
-        pid: null,
-        connectedSince: null,
-        nextRetryAt: null,
-        lastError: msg,
-        diagnosticHint: '请确认 Windows 已内置 OpenSSH Client（C:\\Windows\\System32\\OpenSSH\\ssh.exe）。',
-      });
-      this.desiredRunning = false;
+      void this.abortPoolWithFatalError(
+        msg,
+        '请确认 Windows 已内置 OpenSSH Client（C:\\Windows\\System32\\OpenSSH\\ssh.exe）。'
+      );
       return;
     }
 
-    this.child = child;
-    this.emit({
-      state: isReconnect ? 'reconnecting' : 'connecting',
-      pid: child.pid ?? null,
-      nextRetryAt: null,
-    });
+    worker.child = child;
+    this.syncAggregateStatus();
 
     child.stdout?.on('data', (chunk: Buffer) => {
       const text = decodeSshOutputChunk(chunk).trim();
-      if (text) logger.info('tunnel', text);
+      if (text) logger.info('tunnel', `[通道 #${worker.slotIndex + 1}] ${text}`);
     });
 
     child.stderr?.on('data', (chunk: Buffer) => {
@@ -309,236 +517,472 @@ class TunnelManager {
           logger.info(
             'tunnel',
             isDnsMiss
-              ? `${line}（单条请求目标域名解析失败，不影响主隧道）`
-              : `${line}（单条子通道失败，不影响主隧道）`
+              ? `[通道 #${worker.slotIndex + 1}] ${line}（单条目标域名解析失败，不影响隧道）`
+              : `[通道 #${worker.slotIndex + 1}] ${line}（单条子通道失败，不影响隧道）`
           );
           continue;
         }
 
-        const existingLines = this.stderrBuffer
+        const existingLines = worker.stderrBuffer
           .split('\n')
           .map((l) => l.trim())
           .filter(Boolean);
         existingLines.push(line);
-        this.stderrBuffer = existingLines.slice(-8).join('\n');
-        logger.warn('tunnel', line);
+        worker.stderrBuffer = existingLines.slice(-8).join('\n');
+        logger.warn('tunnel', `[通道 #${worker.slotIndex + 1}] ${line}`);
       }
     });
 
-    // Poll local listening port to accurately transition to 'connected'
+    // Poll internal worker port until ready
     let pollAttempts = 0;
-    this.listenPollTimer = setInterval(async () => {
-      if (!this.desiredRunning || this.child !== child) {
-        if (this.listenPollTimer) {
-          clearInterval(this.listenPollTimer);
-          this.listenPollTimer = null;
+    worker.listenPollTimer = setInterval(async () => {
+      if (!this.desiredRunning || epoch !== this.sessionEpoch || worker.child !== child) {
+        if (worker.listenPollTimer) {
+          clearInterval(worker.listenPollTimer);
+          worker.listenPollTimer = null;
         }
         return;
       }
+
       pollAttempts += 1;
-      const listening = await isLocalPortListening(node.localPort);
+      const listening = await isLocalPortListening(worker.internalPort);
+      if (!this.desiredRunning || epoch !== this.sessionEpoch || worker.child !== child) {
+        return;
+      }
+
       if (listening) {
-        if (this.listenPollTimer) {
-          clearInterval(this.listenPollTimer);
-          this.listenPollTimer = null;
+        if (worker.listenPollTimer) {
+          clearInterval(worker.listenPollTimer);
+          worker.listenPollTimer = null;
         }
-        logger.success(
-          'tunnel',
-          `隧道已就绪！本地监听 127.0.0.1:${node.localPort} (${node.mode === 'socks5' ? 'SOCKS5' : 'HTTP/本地转发'})`
-        );
-        this.emit({
-          state: 'connected',
-          pid: child.pid ?? null,
-          connectedSince: Date.now(),
-          nextRetryAt: null,
-          lastError: null,
-          diagnosticHint: null,
+
+        // Mark healthy and register in LocalProxyBalancer immediately
+        worker.state = 'healthy';
+        worker.consecutiveHealthFailures = 0;
+        this.balancer.upsertBackend({
+          id: worker.id,
+          port: worker.internalPort,
+          healthy: true,
+          latencyMs: worker.latencyMs,
+          draining: false,
         });
 
-        // Start active end-to-end health probe to detect frozen/zombie tunnels
-        this.startHealthCheckLoop(child, node);
+        // If this worker was a Make-Before-Break rotation replacement, now gracefully drain the old worker
+        if (worker.replacingWorkerId) {
+          const oldId = worker.replacingWorkerId;
+          worker.replacingWorkerId = null;
+          worker.isRotationCandidate = false;
+          this.beginDrainingWorker(oldId, epoch);
+        }
 
-        // Reset backoff counter after stable operation so future blips recover in ~1s
-        this.stableResetTimer = setTimeout(() => {
-          this.stableResetTimer = null;
-          if (this.desiredRunning && this.child === child && this.status.state === 'connected') {
-            if (this.status.reconnectCount > 0) {
-              this.emit({ reconnectCount: 0 });
+        logger.success(
+          'tunnel',
+          `[通道 #${worker.slotIndex + 1}] 已就绪并加入调度池 (内部端口 :${worker.internalPort}, PID=${child.pid ?? '-'})`
+        );
+
+        this.syncAggregateStatus();
+        this.startWorkerHealthLoop(worker, child, epoch);
+
+        // Reset backoff counter after stable 60s
+        worker.stableResetTimer = setTimeout(() => {
+          worker.stableResetTimer = null;
+          if (
+            this.desiredRunning &&
+            epoch === this.sessionEpoch &&
+            worker.child === child &&
+            worker.state === 'healthy'
+          ) {
+            if (worker.reconnectCount > 0) {
+              worker.reconnectCount = 0;
+              this.syncAggregateStatus();
             }
           }
         }, STABLE_RESET_MS);
       } else if (pollAttempts > 40) {
-        // 20 seconds elapsed without opening port: kill hung ssh.exe to trigger backoff reconnect
-        if (this.listenPollTimer) {
-          clearInterval(this.listenPollTimer);
-          this.listenPollTimer = null;
+        if (worker.listenPollTimer) {
+          clearInterval(worker.listenPollTimer);
+          worker.listenPollTimer = null;
         }
-        logger.warn('tunnel', 'SSH 握手超过 20 秒未打开本地监听端口，主动中止并尝试重连...');
-        if (!this.stderrBuffer.trim()) {
-          this.stderrBuffer = 'Connection timed out (SSH 握手超时未监听本地端口)';
+        logger.warn(
+          'tunnel',
+          `[通道 #${worker.slotIndex + 1}] SSH 握手超过 20 秒未监听端口，主动中止并重连...`
+        );
+        if (!worker.stderrBuffer.trim()) {
+          worker.stderrBuffer = 'Connection timed out (SSH 握手超时未监听内部端口)';
         }
         await this.killChildProcess(child);
       }
     }, 500);
 
     child.once('error', (err) => {
-      if (this.child !== child) return;
-      logger.error('tunnel', `ssh 进程启动失败: ${err.message}`);
-      this.handleUnexpectedExit(-1, err.message);
+      if (worker.child !== child || epoch !== this.sessionEpoch) return;
+      logger.error('tunnel', `[通道 #${worker.slotIndex + 1}] ssh 进程启动失败: ${err.message}`);
+      this.handleWorkerUnexpectedExit(worker, epoch, err.message);
     });
 
     child.once('exit', (code, signal) => {
-      if (this.child !== child) return;
-      this.child = null;
-      this.clearTimers();
+      if (worker.child !== child) return;
+      worker.child = null;
+      this.clearWorkerTimers(worker);
+      this.balancer.removeBackend(worker.id);
 
-      if (!this.desiredRunning) {
-        logger.info('tunnel', '隧道进程已停止。');
-        this.emit({
-          state: 'disconnected',
-          pid: null,
-          connectedSince: null,
-          nextRetryAt: null,
-          lastHealthLatencyMs: null,
-        });
+      if (!this.desiredRunning || epoch !== this.sessionEpoch || worker.state === 'draining') {
+        worker.state = 'stopped';
+        this.workers.delete(worker.id);
+        if (this.desiredRunning && epoch === this.sessionEpoch) {
+          this.syncAggregateStatus();
+        }
         return;
       }
 
       const reason =
-        this.stderrBuffer.trim() ||
+        worker.stderrBuffer.trim() ||
         `SSH 进程异常退出 (code=${code ?? 'null'}, signal=${signal ?? 'none'})`;
-      this.handleUnexpectedExit(code ?? 1, reason);
+      this.handleWorkerUnexpectedExit(worker, epoch, reason);
     });
   }
 
-  private scheduleReconnect(reason: string): void {
-    const nextReconnectCount = this.status.reconnectCount + 1;
-    const delayMs = computeReconnectDelayMs(nextReconnectCount);
-    const nextRetryAt = Date.now() + delayMs;
-    const hint = diagnoseSshError(reason);
+  private startWorkerHealthLoop(worker: PoolWorker, child: ChildProcess, epoch: number): void {
+    const node = this.activeNode;
+    if (!node || node.healthCheckEnabled === false) return;
 
+    const rawSec = node.healthCheckIntervalSec;
+    const intervalSec =
+      typeof rawSec === 'number' && Number.isFinite(rawSec) && rawSec >= 10 && rawSec <= 120
+        ? Math.round(rawSec)
+        : 25;
+
+    // Initial probe staggered slightly so UI gets RTT without spiking all workers simultaneously
+    const initialDelayMs = 2000 + worker.slotIndex * 600;
+    const initTimer = setTimeout(() => {
+      if (this.desiredRunning && epoch === this.sessionEpoch && worker.child === child) {
+        void this.probeWorkerNow(worker, epoch);
+      }
+    }, initialDelayMs);
+    this.staggerTimers.push(initTimer);
+
+    worker.healthCheckTimer = setInterval(() => {
+      if (this.desiredRunning && epoch === this.sessionEpoch && worker.child === child) {
+        void this.probeWorkerNow(worker, epoch);
+      }
+    }, intervalSec * 1000);
+  }
+
+  private async probeWorkerNow(worker: PoolWorker, epoch: number): Promise<boolean> {
+    const node = this.activeNode;
+    const child = worker.child;
+    if (
+      !node ||
+      !child ||
+      !this.desiredRunning ||
+      epoch !== this.sessionEpoch ||
+      worker.state !== 'healthy' ||
+      worker.healthCheckInFlight
+    ) {
+      return true;
+    }
+
+    worker.healthCheckInFlight = true;
+    try {
+      const res = await probeTunnelHealth(
+        node.mode,
+        worker.internalPort,
+        node.sshPort,
+        HEALTH_PROBE_TIMEOUT_MS
+      );
+      if (
+        !this.desiredRunning ||
+        epoch !== this.sessionEpoch ||
+        worker.child !== child ||
+        worker.state !== 'healthy'
+      ) {
+        return true;
+      }
+
+      if (res.ok) {
+        worker.consecutiveHealthFailures = 0;
+        worker.latencyMs = res.latencyMs;
+        this.balancer.upsertBackend({
+          id: worker.id,
+          port: worker.internalPort,
+          healthy: true,
+          latencyMs: res.latencyMs,
+          draining: false,
+        });
+        this.syncAggregateStatus({ lastHealthCheckAt: Date.now() });
+        return true;
+      }
+
+      worker.consecutiveHealthFailures += 1;
+      logger.warn(
+        'tunnel',
+        `[通道 #${worker.slotIndex + 1}] 端到端探活失败 (${worker.consecutiveHealthFailures}/${HEALTH_FAIL_THRESHOLD}): ${res.detail}`
+      );
+      if (worker.consecutiveHealthFailures >= HEALTH_FAIL_THRESHOLD) {
+        logger.warn(
+          'tunnel',
+          `[通道 #${worker.slotIndex + 1}] 判定假死，已从调度池摘除并重建（其余健康通道不受影响）`
+        );
+        this.balancer.removeBackend(worker.id);
+        worker.stderrBuffer = '端到端健康探活连续失败（隧道假死）';
+        await this.killChildProcess(child);
+      }
+      return false;
+    } finally {
+      worker.healthCheckInFlight = false;
+    }
+  }
+
+  private handleWorkerUnexpectedExit(worker: PoolWorker, epoch: number, reason: string): void {
+    if (!this.desiredRunning || epoch !== this.sessionEpoch) return;
+
+    // If this was a rotation candidate that failed to come up, leave the original healthy worker untouched!
+    if (worker.isRotationCandidate && worker.replacingWorkerId) {
+      logger.warn(
+        'tunnel',
+        `[通道 #${worker.slotIndex + 1}·热轮换] 新替补通道建立失败（${reason}），保留原健康通道继续服务`
+      );
+      this.workers.delete(worker.id);
+      this.syncAggregateStatus();
+      return;
+    }
+
+    if (isHardSshAuthFailure(reason)) {
+      const hint = diagnoseSshError(reason);
+      void this.abortPoolWithFatalError(reason, hint);
+      return;
+    }
+
+    this.scheduleWorkerReconnect(worker, epoch, reason);
+  }
+
+  private scheduleWorkerReconnect(worker: PoolWorker, epoch: number, reason: string): void {
+    if (!this.desiredRunning || epoch !== this.sessionEpoch) return;
+
+    worker.reconnectCount += 1;
+    const delayMs = computeReconnectDelayMs(worker.reconnectCount);
+    worker.state = 'reconnecting';
+    worker.latencyMs = null;
+    worker.nextRetryAt = Date.now() + delayMs;
+
+    const hint = diagnoseSshError(reason);
     logger.warn(
       'tunnel',
-      `隧道已断开（${reason}），将于 ${(delayMs / 1000).toFixed(1)} 秒后执行第 ${nextReconnectCount} 次自动重连...`
+      `[通道 #${worker.slotIndex + 1}] 已断开（${reason}），${(delayMs / 1000).toFixed(1)} 秒后执行第 ${worker.reconnectCount} 次自动重连...`
     );
 
-    this.emit({
-      state: 'reconnecting',
-      pid: null,
-      connectedSince: null,
-      reconnectCount: nextReconnectCount,
-      nextRetryAt,
-      lastHealthLatencyMs: null,
-      lastError: reason,
-      diagnosticHint: hint,
-    });
+    const hasOtherHealthy = Array.from(this.workers.values()).some((w) => w.state === 'healthy');
+    this.syncAggregateStatus(
+      hasOtherHealthy ? {} : { lastError: reason, diagnosticHint: hint }
+    );
 
-    this.reconnectTimer = setTimeout(async () => {
-      this.reconnectTimer = null;
-      if (!this.desiredRunning || !this.activeNode) return;
+    worker.reconnectTimer = setTimeout(async () => {
+      worker.reconnectTimer = null;
+      if (!this.desiredRunning || epoch !== this.sessionEpoch || !this.activeNode) return;
 
-      // On subsequent retries (attempt >= 2), run a lightweight TCP pre-check first
-      // to avoid spawning ssh.exe repeatedly while the machine is completely offline.
-      if (nextReconnectCount >= 2) {
+      // On retry >= 2, run lightweight TCP pre-check before spawning ssh.exe
+      if (worker.reconnectCount >= 2) {
         const probe = await testTcpConnection(this.activeNode.host, this.activeNode.sshPort, 4000);
-        if (!this.desiredRunning || !this.activeNode) return;
+        if (!this.desiredRunning || epoch !== this.sessionEpoch || !this.activeNode) return;
         if (!probe.reachable) {
-          this.scheduleReconnect(`网络预检不可达: ${probe.detail}`);
+          this.scheduleWorkerReconnect(worker, epoch, `网络预检不可达: ${probe.detail}`);
           return;
         }
       }
 
-      this.spawnTunnelProcess(true);
+      // Allocate a fresh internal port on reconnect to avoid Windows TIME_WAIT / lingering socket clash
+      try {
+        worker.internalPort = await findFreeLocalPort();
+      } catch {
+        // Keep existing port as fallback
+      }
+      if (!this.desiredRunning || epoch !== this.sessionEpoch) return;
+      this.spawnWorkerProcess(worker, epoch, true);
     }, delayMs);
   }
 
-  private handleUnexpectedExit(_code: number, reason: string): void {
-    const hint = diagnoseSshError(reason);
+  private beginDrainingWorker(workerId: string, epoch: number): void {
+    const oldW = this.workers.get(workerId);
+    if (!oldW) return;
 
-    if (isHardSshAuthFailure(reason)) {
-      this.desiredRunning = false;
-      logger.error('tunnel', `检测到认证/指纹/配置错误，已暂停自动重连: ${reason}`);
-      this.emit({
-        state: 'error',
-        pid: null,
-        connectedSince: null,
-        nextRetryAt: null,
-        lastHealthLatencyMs: null,
-        lastError: reason,
-        diagnosticHint: hint,
-      });
+    oldW.state = 'draining';
+    this.clearWorkerTimers(oldW);
+    this.balancer.upsertBackend({
+      id: oldW.id,
+      port: oldW.internalPort,
+      healthy: true,
+      latencyMs: oldW.latencyMs,
+      draining: true,
+    });
+    this.syncAggregateStatus();
+
+    const startedDrainAt = Date.now();
+    const finishDrain = async () => {
+      if (oldW.drainTimer) {
+        clearInterval(oldW.drainTimer);
+        oldW.drainTimer = null;
+      }
+      this.balancer.removeBackend(oldW.id);
+      const child = oldW.child;
+      oldW.child = null;
+      oldW.state = 'stopped';
+      this.workers.delete(oldW.id);
+      await this.killChildProcess(child);
+      if (this.desiredRunning && epoch === this.sessionEpoch) {
+        logger.info('tunnel', `[通道 #${oldW.slotIndex + 1}] 旧连接已优雅排空并下线`);
+        this.syncAggregateStatus();
+      }
+    };
+
+    if (this.balancer.getBackendActiveConnections(oldW.id) === 0) {
+      void finishDrain();
       return;
     }
 
-    this.scheduleReconnect(reason);
+    oldW.drainTimer = setInterval(() => {
+      const active = this.balancer.getBackendActiveConnections(oldW.id);
+      if (active === 0 || Date.now() - startedDrainAt >= DRAIN_MAX_WAIT_MS) {
+        void finishDrain();
+      }
+    }, 1000);
+  }
+
+  private async rotateSlotGracefully(slotIndex: number, epoch: number): Promise<void> {
+    if (!this.desiredRunning || epoch !== this.sessionEpoch) return;
+
+    // Find current active healthy worker for this slot (skip if already rotating or reconnecting)
+    const slotWorkers = Array.from(this.workers.values()).filter((w) => w.slotIndex === slotIndex);
+    if (slotWorkers.some((w) => w.isRotationCandidate || w.state === 'draining')) {
+      return;
+    }
+    const current = slotWorkers.find((w) => w.state === 'healthy');
+    if (!current) return;
+
+    logger.info('tunnel', `[通道 #${slotIndex + 1}] 开始 Make-Before-Break 无感热轮换...`);
+    await this.launchWorkerForSlot(slotIndex, epoch, false, current.id, 0);
+  }
+
+  /**
+   * Smoothly replaces all healthy workers one-by-one (Make-Before-Break) without dropping active traffic.
+   */
+  public async rotateAllGracefully(): Promise<ActionResult<TunnelStatus>> {
+    if (!this.desiredRunning || !this.activeNode) {
+      return { ok: false, message: '当前隧道未运行，无法执行平滑轮换' };
+    }
+    const epoch = this.sessionEpoch;
+    const poolSize = this.resolvePoolSize(this.activeNode);
+    logger.info('tunnel', `开始全池平滑热轮换 (${poolSize} 条通道，先建后拆，业务不断流)...`);
+
+    for (let slot = 0; slot < poolSize; slot++) {
+      const timer = setTimeout(() => {
+        if (this.desiredRunning && epoch === this.sessionEpoch) {
+          void this.rotateSlotGracefully(slot, epoch);
+        }
+      }, slot * 1200);
+      this.staggerTimers.push(timer);
+    }
+
+    return {
+      ok: true,
+      message: '已触发全池无感平滑热轮换（先建立新通道，再优雅排空旧通道）',
+      data: this.getStatus(),
+    };
+  }
+
+  private async abortPoolWithFatalError(reason: string, hint: string | null): Promise<void> {
+    this.sessionEpoch += 1;
+    this.desiredRunning = false;
+    this.clearGlobalTimers();
+
+    const toKill: Promise<void>[] = [];
+    for (const w of this.workers.values()) {
+      this.clearWorkerTimers(w);
+      const child = w.child;
+      w.child = null;
+      w.state = 'stopped';
+      toKill.push(this.killChildProcess(child));
+    }
+    this.workers.clear();
+    await Promise.all(toKill);
+    await this.balancer.stop();
+
+    logger.error('tunnel', `检测到认证/指纹/配置错误，已暂停连接池自动重连: ${reason}`);
+    this.emit({
+      state: 'error',
+      pid: null,
+      connectedSince: null,
+      nextRetryAt: null,
+      lastHealthLatencyMs: null,
+      healthyWorkers: 0,
+      activeConnections: 0,
+      workers: [],
+      lastError: reason,
+      diagnosticHint: hint,
+    });
   }
 
   /**
    * Called when OS wakes from sleep/hibernate (Electron powerMonitor 'resume').
-   * Proactively tests or immediately rebuilds the tunnel instead of waiting 45s+ for keepalive timeout.
+   * Proactively verifies all healthy workers and immediately wakes up any workers waiting on backoff.
    */
   public handleSystemResume(): void {
     if (!this.desiredRunning || !this.activeNode) return;
+    const epoch = this.sessionEpoch;
+    logger.info('tunnel', '检测到系统休眠唤醒，正在快速校验所有连接池通道...');
 
-    if (this.reconnectTimer) {
-      logger.info('tunnel', '检测到系统休眠唤醒，取消退避等待并立即尝试重连...');
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-      this.emit({ reconnectCount: 0, nextRetryAt: null });
-      this.resumeProbeTimer = setTimeout(() => {
-        this.resumeProbeTimer = null;
-        if (this.desiredRunning) {
-          this.spawnTunnelProcess(true);
-        }
-      }, 1500);
-      return;
+    if (this.resumeProbeTimer) {
+      clearTimeout(this.resumeProbeTimer);
     }
 
-    if (this.child && this.status.state === 'connected') {
-      const targetChild = this.child;
-      const targetNode = this.activeNode;
-      logger.info('tunnel', '检测到系统休眠唤醒，正在快速校验隧道连通性...');
-      if (this.resumeProbeTimer) {
-        clearTimeout(this.resumeProbeTimer);
+    this.resumeProbeTimer = setTimeout(async () => {
+      this.resumeProbeTimer = null;
+      if (!this.desiredRunning || epoch !== this.sessionEpoch) return;
+
+      for (const w of Array.from(this.workers.values())) {
+        if (w.reconnectTimer) {
+          clearTimeout(w.reconnectTimer);
+          w.reconnectTimer = null;
+          w.reconnectCount = 0;
+          w.nextRetryAt = null;
+          this.spawnWorkerProcess(w, epoch, true);
+        } else if (w.state === 'healthy' && w.child) {
+          const ok = await this.probeWorkerNow(w, epoch);
+          if (!ok && w.child && w.state === 'healthy') {
+            // Wake probe failed once: rebuild immediately instead of waiting for 2nd interval
+            logger.warn(
+              'tunnel',
+              `[通道 #${w.slotIndex + 1}] 休眠唤醒后已失效，立即重建...`
+            );
+            this.balancer.removeBackend(w.id);
+            w.reconnectCount = 0;
+            w.stderrBuffer = '系统休眠唤醒后连接失效';
+            await this.killChildProcess(w.child);
+          }
+        }
       }
-      // Wait 1.5s for Wi-Fi / NIC to re-associate after wake, then verify end-to-end liveness
-      this.resumeProbeTimer = setTimeout(async () => {
-        this.resumeProbeTimer = null;
-        if (!this.desiredRunning || this.child !== targetChild) return;
-        const probe = await probeTunnelHealth(
-          targetNode.mode,
-          targetNode.localPort,
-          targetNode.sshPort,
-          5000
-        );
-        if (!this.desiredRunning || this.child !== targetChild) return;
-        if (probe.ok) {
-          logger.success('tunnel', `休眠唤醒校验通过，隧道依然畅通 (${probe.latencyMs}ms)`);
-          this.emit({
-            lastHealthCheckAt: Date.now(),
-            lastHealthLatencyMs: probe.latencyMs,
-          });
-        } else {
-          logger.warn('tunnel', `休眠唤醒后隧道已失效（${probe.detail}），立即重建连接...`);
-          this.emit({ reconnectCount: 0 });
-          this.stderrBuffer = '系统休眠唤醒后连接失效';
-          await this.killChildProcess(targetChild);
-        }
-      }, 1500);
-    }
+    }, 1500);
   }
 
   public async stop(silent = false): Promise<ActionResult<TunnelStatus>> {
+    this.sessionEpoch += 1;
     this.desiredRunning = false;
-    this.clearTimers();
+    this.clearGlobalTimers();
 
-    const child = this.child;
-    this.child = null;
+    const toKill: Promise<void>[] = [];
+    for (const w of this.workers.values()) {
+      this.clearWorkerTimers(w);
+      const child = w.child;
+      w.child = null;
+      w.state = 'stopped';
+      toKill.push(this.killChildProcess(child));
+    }
+    this.workers.clear();
 
-    await this.killChildProcess(child);
+    await Promise.all(toKill);
+    await this.balancer.stop();
 
     if (!silent) {
-      logger.info('tunnel', '已手动断开隧道连接并停止自动守护。');
+      logger.info('tunnel', '已手动断开多隧道连接池并停止所有后台守护进程。');
     }
 
     this.emit({
@@ -549,6 +993,11 @@ class TunnelManager {
       nextRetryAt: null,
       lastHealthCheckAt: null,
       lastHealthLatencyMs: null,
+      healthyWorkers: 0,
+      activeConnections: 0,
+      totalBytesUp: 0,
+      totalBytesDown: 0,
+      workers: [],
       lastError: null,
       diagnosticHint: null,
     });
@@ -561,7 +1010,7 @@ class TunnelManager {
       return { ok: false, message: '当前没有可重连的活动节点' };
     }
     const target = this.activeNode;
-    logger.info('tunnel', '收到手动「立即重连」指令，正在重建隧道...');
+    logger.info('tunnel', '收到手动「立即重连」指令，正在重建多隧道连接池...');
     await this.stop(true);
     return this.start(target);
   }
@@ -572,7 +1021,7 @@ class TunnelManager {
   public async killOrphanSshProcesses(): Promise<ActionResult> {
     await this.stop(true);
     if (!IS_WINDOWS) {
-      return { ok: true, message: '已停止当前应用托管的隧道进程。' };
+      return { ok: true, message: '已停止当前应用托管的所有隧道进程。' };
     }
     const res = await execCmd('taskkill', ['/F', '/IM', 'ssh.exe'], { timeoutMs: 5000 });
     if (res.code === 0) {
