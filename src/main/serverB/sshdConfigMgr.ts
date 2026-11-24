@@ -25,6 +25,10 @@ export function readSshdConfigState(): SshdConfigState {
       tcpKeepAlive: true,
       clientAliveInterval: 0,
       clientAliveCountMax: 3,
+      useDns: false,
+      compression: 'delayed',
+      maxSessions: 10,
+      maxStartups: '10:30:100',
       hasMatchAdminBlock: false,
       rawContent: '',
     };
@@ -42,6 +46,10 @@ export function readSshdConfigState(): SshdConfigState {
     tcpKeepAlive: parsed.tcpKeepAlive,
     clientAliveInterval: parsed.clientAliveInterval,
     clientAliveCountMax: parsed.clientAliveCountMax,
+    useDns: parsed.useDns,
+    compression: parsed.compression,
+    maxSessions: parsed.maxSessions,
+    maxStartups: parsed.maxStartups,
     hasMatchAdminBlock: parsed.hasMatchAdminBlock,
     rawContent,
   };

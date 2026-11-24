@@ -88,12 +88,49 @@ describe('sshConfigParser', () => {
     expect(reparsed.clientAliveCountMax).toBe(3);
   });
 
-  it('rejects out-of-range ports', () => {
+  it('writes performance directives (UseDNS, Compression, MaxSessions, MaxStartups) strictly before Match block', () => {
+    const updated = updateSshdConfig(DEFAULT_WIN_SSHD_CONFIG, {
+      port: 53622,
+      pubkeyAuthentication: true,
+      passwordAuthentication: false,
+      useDns: false,
+      compression: 'no',
+      maxSessions: 64,
+      maxStartups: '30:50:100',
+    });
+
+    const matchIdx = updated.indexOf('Match Group administrators');
+    expect(updated.indexOf('UseDNS no')).toBeGreaterThan(-1);
+    expect(updated.indexOf('UseDNS no')).toBeLessThan(matchIdx);
+    expect(updated.indexOf('Compression no')).toBeGreaterThan(-1);
+    expect(updated.indexOf('Compression no')).toBeLessThan(matchIdx);
+    expect(updated.indexOf('MaxSessions 64')).toBeGreaterThan(-1);
+    expect(updated.indexOf('MaxSessions 64')).toBeLessThan(matchIdx);
+    expect(updated.indexOf('MaxStartups 30:50:100')).toBeGreaterThan(-1);
+    expect(updated.indexOf('MaxStartups 30:50:100')).toBeLessThan(matchIdx);
+
+    const reparsed = parseSshdConfig(updated);
+    expect(reparsed.useDns).toBe(false);
+    expect(reparsed.compression).toBe('no');
+    expect(reparsed.maxSessions).toBe(64);
+    expect(reparsed.maxStartups).toBe('30:50:100');
+  });
+
+  it('rejects out-of-range ports and invalid MaxStartups syntax', () => {
     expect(() =>
       updateSshdConfig(DEFAULT_WIN_SSHD_CONFIG, {
         port: 70000,
         pubkeyAuthentication: true,
         passwordAuthentication: false,
+      })
+    ).toThrow();
+
+    expect(() =>
+      updateSshdConfig(DEFAULT_WIN_SSHD_CONFIG, {
+        port: 53622,
+        pubkeyAuthentication: true,
+        passwordAuthentication: false,
+        maxStartups: 'invalid:format',
       })
     ).toThrow();
   });

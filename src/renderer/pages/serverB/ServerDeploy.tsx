@@ -45,7 +45,9 @@ export const ServerDeploy: React.FC<ServerDeployProps> = ({
   );
   const step4Done = step3Done && !port22StillEnabled;
   const step5Done = Boolean(
-    overview?.service.failureRecoveryConfigured && overview?.updatePolicy.autoRebootDisabled
+    overview?.service.failureRecoveryConfigured &&
+      overview?.updatePolicy.autoRebootDisabled &&
+      overview?.systemTuning.tuned
   );
 
   const handleInstallSsh = async () => {
@@ -100,6 +102,10 @@ export const ServerDeploy: React.FC<ServerDeployProps> = ({
         tcpKeepAlive: true,
         clientAliveInterval: 30,
         clientAliveCountMax: 3,
+        useDns: false,
+        compression: 'no',
+        maxSessions: 64,
+        maxStartups: '30:50:100',
       });
       if (!cfgRes.ok) {
         onNotify('error', cfgRes.message);
@@ -111,7 +117,7 @@ export const ServerDeploy: React.FC<ServerDeployProps> = ({
       onNotify(
         restartRes.ok ? 'success' : 'error',
         restartRes.ok
-          ? `已完成高位端口 TCP ${targetPort} 加固、放行防火墙并重启 sshd！请在云控制台安全组放行 TCP ${targetPort} 后到设备 A 验证。`
+          ? `已完成高位端口 TCP ${targetPort} 加固、弱网性能参数写入、放行防火墙并重启 sshd！请在云控制台安全组放行 TCP ${targetPort} 后到设备 A 验证。`
           : restartRes.message
       );
       await onRefresh();
@@ -136,10 +142,17 @@ export const ServerDeploy: React.FC<ServerDeployProps> = ({
     try {
       const r1 = await window.relayApi.configureSshdFailureRecovery();
       const r2 = await window.relayApi.setDisableAutoReboot(true);
-      if (r1.ok && r2.ok) {
-        onNotify('success', '已完成 sshd 崩溃 5 秒自愈与禁止 Windows 自动重启配置！');
+      const r3 = await window.relayApi.applyServerSystemTuning();
+      if (r1.ok && r2.ok && r3.ok) {
+        onNotify('success', '已完成 sshd 崩溃自愈、禁自动重启与跨国弱网 TCP/电源调优！');
       } else {
-        onNotify('error', `${r1.ok ? '' : r1.message} ${r2.ok ? '' : r2.message}`.trim());
+        onNotify(
+          'error',
+          [r1, r2, r3]
+            .filter((r) => !r.ok)
+            .map((r) => r.message)
+            .join(' | ')
+        );
       }
       await onRefresh();
     } finally {
@@ -324,22 +337,21 @@ export const ServerDeploy: React.FC<ServerDeployProps> = ({
         </div>
         <div className="step-body">
           <div className="step-title">
-            长期稳定加固：sshd 崩溃 5 秒自愈 & 禁止自动更新重启
+            长期稳定与弱网调优：sshd 崩溃自愈、禁自动重启 & TCP/防休眠调优
             <StatusBadge
               variant={step5Done ? 'success' : 'neutral'}
               label={step5Done ? '已完成' : '推荐开启'}
             />
           </div>
           <p className="step-desc">
-            配置 <code className="mono">sc.exe failure sshd</code> 故障 5000ms 自动重启，并写入 Windows Update 策略（
-            <code className="mono">AUOptions=2</code>、<code className="mono">NoAutoRebootWithLoggedOnUsers=1</code>）防止半夜自动更新重启打断隧道。
+            一键配置 <code className="mono">sc.exe failure sshd</code> 崩溃 5 秒拉起、禁用 Windows 更新强制重启、关闭电源休眠，并启用跨国弱网 TCP 调优（CUBIC/CTCP 拥塞控制、AutoTuning、Timestamps、禁用 ECN）。
           </p>
           <button
             className="btn btn-primary"
             onClick={handleApplyStability}
             disabled={busyStep !== null}
           >
-            {busyStep === 5 ? '正在应用策略...' : '一键应用长期稳定策略'}
+            {busyStep === 5 ? '正在应用策略...' : '一键应用长期稳定与弱网调优'}
           </button>
         </div>
       </div>

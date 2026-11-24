@@ -16,6 +16,10 @@ export interface NodeProfile {
   compression?: boolean; // Default false (HTTPS/TLS does not benefit from SSH -C)
   serverAliveInterval?: number; // Default 15 seconds
   serverAliveCountMax?: number; // Default 3
+  forceIpv4?: boolean; // Default true: avoid slow/broken IPv6 fallback on cross-border routes
+  preferFastCipher?: boolean; // Default true: prioritize AES-GCM / ChaCha20 hardware-accelerated ciphers
+  healthCheckEnabled?: boolean; // Default true: active end-to-end tunnel liveness probe
+  healthCheckIntervalSec?: number; // Default 25 seconds
   notes?: string;
 }
 
@@ -24,6 +28,7 @@ export interface BrowserPrefs {
   customBrowserPath: string;
   userDataDir: string; // Empty means default %LOCALAPPDATA%\Edge or Chrome
   useHostResolverRules: boolean; // Default false per ssh.md 5.3 & 6
+  disableQuic?: boolean; // Default true in SOCKS5 mode to avoid HTTP/3 UDP fallback latency
   startUrl: string;
 }
 
@@ -58,6 +63,9 @@ export interface TunnelStatus {
   pid: number | null;
   connectedSince: number | null;
   reconnectCount: number;
+  nextRetryAt: number | null;
+  lastHealthCheckAt: number | null;
+  lastHealthLatencyMs: number | null;
   lastError: string | null;
   diagnosticHint: string | null;
 }
@@ -163,6 +171,10 @@ export interface SshdConfigState {
   tcpKeepAlive: boolean;
   clientAliveInterval: number;
   clientAliveCountMax: number;
+  useDns: boolean;
+  compression: string;
+  maxSessions: number;
+  maxStartups: string;
   hasMatchAdminBlock: boolean;
   rawContent: string;
 }
@@ -199,6 +211,16 @@ export interface WindowsUpdatePolicyState {
   autoRebootDisabled: boolean;
 }
 
+export interface ServerSystemTuningState {
+  sleepDisabled: boolean;
+  standbyTimeoutAcSec: number | null;
+  tcpAutoTuning: string;
+  tcpCongestionProvider: string;
+  tcpEcnCapability: string;
+  tcpTimestamps: string;
+  tuned: boolean;
+}
+
 export interface ActiveConnectionInfo {
   protocol: string;
   localAddress: string;
@@ -215,6 +237,7 @@ export interface ServerOverview {
   authorizedKeys: AuthorizedKeysState;
   firewallRules: FirewallRuleInfo[];
   updatePolicy: WindowsUpdatePolicyState;
+  systemTuning: ServerSystemTuningState;
   listeningPorts: string[];
   activeConnections: ActiveConnectionInfo[];
   detectedPublicIp: string | null;

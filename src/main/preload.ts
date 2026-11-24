@@ -14,6 +14,7 @@ import type {
   NodeProfile,
   SecurityCheckResult,
   ServerOverview,
+  ServerSystemTuningState,
   SshdConfigState,
   TunnelStatus,
   WindowsUpdatePolicyState,
@@ -83,6 +84,7 @@ export interface RelayApi {
   allowFirewallPort: (port: number) => Promise<ActionResult>;
   disablePort22FirewallRule: () => Promise<ActionResult>;
   setDisableAutoReboot: (disable: boolean) => Promise<ActionResult<WindowsUpdatePolicyState>>;
+  applyServerSystemTuning: () => Promise<ActionResult<ServerSystemTuningState>>;
 }
 
 const api: RelayApi = {
@@ -140,6 +142,7 @@ const api: RelayApi = {
   allowFirewallPort: (port) => ipcRenderer.invoke('serverB:allowFirewallPort', port),
   disablePort22FirewallRule: () => ipcRenderer.invoke('serverB:disablePort22Firewall'),
   setDisableAutoReboot: (disable) => ipcRenderer.invoke('serverB:setDisableAutoReboot', disable),
+  applyServerSystemTuning: () => ipcRenderer.invoke('serverB:applySystemTuning'),
 };
 
 contextBridge.exposeInMainWorld('relayApi', api);

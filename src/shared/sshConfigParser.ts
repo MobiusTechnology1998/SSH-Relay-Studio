@@ -5,6 +5,10 @@ export interface ParsedSshdConfig {
   tcpKeepAlive: boolean;
   clientAliveInterval: number;
   clientAliveCountMax: number;
+  useDns: boolean;
+  compression: string;
+  maxSessions: number;
+  maxStartups: string;
   hasMatchAdminBlock: boolean;
 }
 
@@ -15,14 +19,19 @@ export interface SshdConfigUpdate {
   tcpKeepAlive?: boolean;
   clientAliveInterval?: number;
   clientAliveCountMax?: number;
+  useDns?: boolean;
+  compression?: 'no' | 'yes' | 'delayed';
+  maxSessions?: number;
+  maxStartups?: string;
 }
 
 const MATCH_LINE_RE = /^\s*Match\s+/i;
+const MAX_STARTUPS_RE = /^\d+(?::\d+:\d+)?$/;
 
 /**
  * Parse key directives from Windows OpenSSH sshd_config.
  * Only inspects global section (lines prior to any `Match` block) for Port,
- * PubkeyAuthentication, PasswordAuthentication, and keepalive directives.
+ * authentication, keepalive, and performance directives.
  */
 export function parseSshdConfig(content: string): ParsedSshdConfig {
   const lines = content.split(/\r?\n/);
@@ -32,6 +41,10 @@ export function parseSshdConfig(content: string): ParsedSshdConfig {
   let tcpKeepAlive = true; // OpenSSH default is yes
   let clientAliveInterval = 0; // OpenSSH default is 0 (disabled)
   let clientAliveCountMax = 3; // OpenSSH default is 3
+  let useDns = false; // OpenSSH 6.8+ default is no
+  let compression = 'delayed'; // OpenSSH default is delayed
+  let maxSessions = 10; // OpenSSH default is 10
+  let maxStartups = '10:30:100'; // OpenSSH default is 10:30:100
   let hasMatchAdminBlock = false;
   let inMatchBlock = false;
 
@@ -93,6 +106,33 @@ export function parseSshdConfig(content: string): ParsedSshdConfig {
       }
       continue;
     }
+
+    const useDnsMatch = trimmed.match(/^UseDNS\s+(yes|no)\b/i);
+    if (useDnsMatch) {
+      useDns = useDnsMatch[1].toLowerCase() === 'yes';
+      continue;
+    }
+
+    const compressionMatch = trimmed.match(/^Compression\s+(yes|no|delayed)\b/i);
+    if (compressionMatch) {
+      compression = compressionMatch[1].toLowerCase();
+      continue;
+    }
+
+    const maxSessionsMatch = trimmed.match(/^MaxSessions\s+(\d+)\b/i);
+    if (maxSessionsMatch) {
+      const parsed = Number.parseInt(maxSessionsMatch[1], 10);
+      if (parsed >= 1 && parsed <= 1000) {
+        maxSessions = parsed;
+      }
+      continue;
+    }
+
+    const maxStartupsMatch = trimmed.match(/^MaxStartups\s+(\S+)/i);
+    if (maxStartupsMatch && MAX_STARTUPS_RE.test(maxStartupsMatch[1])) {
+      maxStartups = maxStartupsMatch[1];
+      continue;
+    }
   }
 
   return {
@@ -102,13 +142,17 @@ export function parseSshdConfig(content: string): ParsedSshdConfig {
     tcpKeepAlive,
     clientAliveInterval,
     clientAliveCountMax,
+    useDns,
+    compression,
+    maxSessions,
+    maxStartups,
     hasMatchAdminBlock,
   };
 }
 
 /**
- * Safely updates Port, PubkeyAuthentication, PasswordAuthentication, and optional keepalive directives
- * in sshd_config.
+ * Safely updates Port, PubkeyAuthentication, PasswordAuthentication, keepalive,
+ * and performance directives in sshd_config.
  * - Replaces existing active or commented directive lines in the global section (before any `Match` block).
  * - Preserves `Match Group administrators` and all unrelated comments/directives intact.
  * - Inserts missing directives right before the first `Match` block (never inside a `Match` block).
@@ -132,6 +176,15 @@ export function updateSshdConfig(content: string, update: SshdConfigUpdate): str
       update.clientAliveCountMax > 20)
   ) {
     throw new Error(`无效 ClientAliveCountMax: ${update.clientAliveCountMax}，有效范围为 1-20`);
+  }
+  if (
+    update.maxSessions !== undefined &&
+    (!Number.isInteger(update.maxSessions) || update.maxSessions < 1 || update.maxSessions > 1000)
+  ) {
+    throw new Error(`无效 MaxSessions: ${update.maxSessions}，有效范围为 1-1000`);
+  }
+  if (update.maxStartups !== undefined && !MAX_STARTUPS_RE.test(update.maxStartups.trim())) {
+    throw new Error(`无效 MaxStartups: ${update.maxStartups}，格式应如 30:50:100`);
   }
 
   const newline = content.includes('\r\n') ? '\r\n' : '\n';
@@ -195,6 +248,42 @@ export function updateSshdConfig(content: string, update: SshdConfigUpdate): str
       activeRe: /^\s*ClientAliveCountMax\s+\S+/i,
       commentedRe: /^\s*#\s*ClientAliveCountMax\s+\S+/i,
       newLine: `ClientAliveCountMax ${update.clientAliveCountMax}`,
+    });
+  }
+
+  if (update.useDns !== undefined) {
+    directives.push({
+      key: 'UseDNS',
+      activeRe: /^\s*UseDNS\s+\S+/i,
+      commentedRe: /^\s*#\s*UseDNS\s+\S+/i,
+      newLine: `UseDNS ${update.useDns ? 'yes' : 'no'}`,
+    });
+  }
+
+  if (update.compression !== undefined) {
+    directives.push({
+      key: 'Compression',
+      activeRe: /^\s*Compression\s+\S+/i,
+      commentedRe: /^\s*#\s*Compression\s+\S+/i,
+      newLine: `Compression ${update.compression}`,
+    });
+  }
+
+  if (update.maxSessions !== undefined) {
+    directives.push({
+      key: 'MaxSessions',
+      activeRe: /^\s*MaxSessions\s+\S+/i,
+      commentedRe: /^\s*#\s*MaxSessions\s+\S+/i,
+      newLine: `MaxSessions ${update.maxSessions}`,
+    });
+  }
+
+  if (update.maxStartups !== undefined) {
+    directives.push({
+      key: 'MaxStartups',
+      activeRe: /^\s*MaxStartups\s+\S+/i,
+      commentedRe: /^\s*#\s*MaxStartups\s+\S+/i,
+      newLine: `MaxStartups ${update.maxStartups.trim()}`,
     });
   }
 

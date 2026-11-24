@@ -6,6 +6,7 @@ import {
   ipcMain,
   Menu,
   nativeImage,
+  powerMonitor,
   shell,
   Tray,
 } from 'electron';
@@ -61,7 +62,12 @@ import {
   readSshdConfigState,
   restoreSshdConfigBackup,
 } from './serverB/sshdConfigMgr';
-import { getWindowsUpdatePolicy, setDisableAutoReboot } from './serverB/stabilityMgr';
+import {
+  applyServerSystemTuning,
+  getServerSystemTuning,
+  getWindowsUpdatePolicy,
+  setDisableAutoReboot,
+} from './serverB/stabilityMgr';
 import { settingsStore } from './store';
 
 let mainWindow: BrowserWindow | null = null;
@@ -380,18 +386,26 @@ function registerIpcHandlers(): void {
   ipcMain.handle('serverB:getOverview', async (): Promise<ServerOverview> => {
     const settings = settingsStore.load();
     const config = readSshdConfigState();
-    const [service, authorizedKeys, firewallRules, updatePolicy, network, detectedPublicIp] =
-      await Promise.all([
-        getOpenSshServiceStatus(),
-        getAuthorizedKeysState(
-          settings.serverPrefs.useAdminAuthorizedKeys,
-          settings.serverPrefs.customAuthorizedKeysPath
-        ),
-        listSshFirewallRules(),
-        getWindowsUpdatePolicy(),
-        inspectNetworkState(config.port),
-        detectServerPublicIp(),
-      ]);
+    const [
+      service,
+      authorizedKeys,
+      firewallRules,
+      updatePolicy,
+      systemTuning,
+      network,
+      detectedPublicIp,
+    ] = await Promise.all([
+      getOpenSshServiceStatus(),
+      getAuthorizedKeysState(
+        settings.serverPrefs.useAdminAuthorizedKeys,
+        settings.serverPrefs.customAuthorizedKeysPath
+      ),
+      listSshFirewallRules(),
+      getWindowsUpdatePolicy(),
+      getServerSystemTuning(),
+      inspectNetworkState(config.port),
+      detectServerPublicIp(),
+    ]);
 
     return {
       service,
@@ -399,6 +413,7 @@ function registerIpcHandlers(): void {
       authorizedKeys,
       firewallRules,
       updatePolicy,
+      systemTuning,
       listeningPorts: network.listeningPorts,
       activeConnections: network.activeConnections,
       detectedPublicIp,
@@ -454,6 +469,7 @@ function registerIpcHandlers(): void {
   ipcMain.handle('serverB:setDisableAutoReboot', (_e, disable: boolean) =>
     setDisableAutoReboot(disable)
   );
+  ipcMain.handle('serverB:applySystemTuning', () => applyServerSystemTuning());
 }
 
 // Single-instance lock
@@ -481,6 +497,11 @@ if (!gotLock) {
     registerIpcHandlers();
     createMainWindow(isAutoStartLaunch && settings.minimizeToTray);
     createTray();
+
+    // Proactively verify or rebuild tunnel on OS wake from sleep/hibernate
+    powerMonitor.on('resume', () => {
+      tunnelManager.handleSystemResume();
+    });
 
     // Forward live tunnel status & logs to renderer + tray
     tunnelManager.subscribe((status) => {

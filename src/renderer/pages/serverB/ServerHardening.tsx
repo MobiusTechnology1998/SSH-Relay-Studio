@@ -28,6 +28,20 @@ export const ServerHardening: React.FC<ServerHardeningProps> = ({
   const [clientAliveCountMax, setClientAliveCountMax] = useState(
     overview?.config.clientAliveCountMax ?? 3
   );
+  const [useDns, setUseDns] = useState(overview?.config.useDns ?? false);
+  const [disableCompression, setDisableCompression] = useState(
+    (overview?.config.compression ?? 'no') === 'no'
+  );
+  const [maxSessions, setMaxSessions] = useState(
+    overview?.config.maxSessions && overview.config.maxSessions >= 16
+      ? overview.config.maxSessions
+      : 64
+  );
+  const [maxStartups, setMaxStartups] = useState(
+    overview?.config.maxStartups && overview.config.maxStartups !== '10:30:100'
+      ? overview.config.maxStartups
+      : '30:50:100'
+  );
   const [customFwPort, setCustomFwPort] = useState(53622);
   const [busy, setBusy] = useState(false);
 
@@ -41,6 +55,14 @@ export const ServerHardening: React.FC<ServerHardeningProps> = ({
       overview.config.clientAliveInterval > 0 ? overview.config.clientAliveInterval : 30
     );
     setClientAliveCountMax(overview.config.clientAliveCountMax || 3);
+    setUseDns(overview.config.useDns);
+    setDisableCompression(overview.config.compression === 'no');
+    setMaxSessions(overview.config.maxSessions >= 16 ? overview.config.maxSessions : 64);
+    setMaxStartups(
+      overview.config.maxStartups && overview.config.maxStartups !== '10:30:100'
+        ? overview.config.maxStartups
+        : '30:50:100'
+    );
     setCustomFwPort(overview.config.port === 22 ? 53622 : overview.config.port);
   }, [
     overview?.config.port,
@@ -49,6 +71,10 @@ export const ServerHardening: React.FC<ServerHardeningProps> = ({
     overview?.config.tcpKeepAlive,
     overview?.config.clientAliveInterval,
     overview?.config.clientAliveCountMax,
+    overview?.config.useDns,
+    overview?.config.compression,
+    overview?.config.maxSessions,
+    overview?.config.maxStartups,
   ]);
 
   const handleSaveSshdConfig = async (andRestart: boolean) => {
@@ -65,6 +91,10 @@ export const ServerHardening: React.FC<ServerHardeningProps> = ({
         tcpKeepAlive,
         clientAliveInterval,
         clientAliveCountMax,
+        useDns,
+        compression: disableCompression ? 'no' : 'delayed',
+        maxSessions,
+        maxStartups,
       });
       if (!res.ok) {
         onNotify('error', res.message);
@@ -130,6 +160,17 @@ export const ServerHardening: React.FC<ServerHardeningProps> = ({
     setBusy(true);
     try {
       const res = await window.relayApi.setDisableAutoReboot(disable);
+      onNotify(res.ok ? 'success' : 'error', res.message);
+      await onRefresh();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleApplySystemTuning = async () => {
+    setBusy(true);
+    try {
+      const res = await window.relayApi.applyServerSystemTuning();
       onNotify(res.ok ? 'success' : 'error', res.message);
       await onRefresh();
     } finally {
@@ -239,6 +280,54 @@ export const ServerHardening: React.FC<ServerHardeningProps> = ({
           </div>
         </div>
 
+        <div className="grid-3">
+          <div className="field" style={{ justifyContent: 'center' }}>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={!useDns}
+                onChange={(e) => setUseDns(!e.target.checked)}
+              />
+              <span>禁用反向 DNS（UseDNS no，加速握手）</span>
+            </label>
+          </div>
+
+          <div className="field" style={{ justifyContent: 'center' }}>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={disableCompression}
+                onChange={(e) => setDisableCompression(e.target.checked)}
+              />
+              <span>禁用服务端压缩（Compression no）</span>
+            </label>
+          </div>
+
+          <div className="field">
+            <label className="field-label">并发会话上限 MaxSessions</label>
+            <input
+              className="input mono"
+              type="number"
+              min={1}
+              max={1000}
+              value={maxSessions}
+              onChange={(e) => setMaxSessions(Math.max(1, Number(e.target.value) || 64))}
+            />
+          </div>
+        </div>
+
+        <div className="grid-3">
+          <div className="field">
+            <label className="field-label">并发握手上限 MaxStartups（防多隧道/快速重连被限流）</label>
+            <input
+              className="input mono"
+              value={maxStartups}
+              onChange={(e) => setMaxStartups(e.target.value)}
+              placeholder="30:50:100"
+            />
+          </div>
+        </div>
+
         <div className="row-wrap" style={{ marginTop: 4 }}>
           <button
             className="btn btn-primary"
@@ -322,7 +411,7 @@ export const ServerHardening: React.FC<ServerHardeningProps> = ({
         )}
       </div>
 
-      {/* Stability Cards */}
+      {/* Stability & Cross-Border Network Tuning Cards */}
       <div className="grid-2">
         <div className="card stack-sm">
           <div className="row-between">
@@ -377,6 +466,60 @@ export const ServerHardening: React.FC<ServerHardeningProps> = ({
               </button>
             )}
           </div>
+        </div>
+      </div>
+
+      {/* Cross-Border TCP & Power Tuning Card */}
+      <div className="card stack-sm">
+        <div className="row-between">
+          <div>
+            <h3 className="card-title">跨国弱网 TCP 协议栈与防休眠调优</h3>
+            <p className="card-subtitle">
+              开启 CUBIC/CTCP 高延迟抗丢包拥塞控制、TCP 接收窗口自动扩展、TCP Timestamps，关闭易引发跨网丢包的 ECN，并禁用电源休眠与网卡节能
+            </p>
+          </div>
+          <StatusBadge
+            variant={overview?.systemTuning.tuned ? 'success' : 'warn'}
+            label={overview?.systemTuning.tuned ? '已调优' : '待优化'}
+          />
+        </div>
+
+        <div className="grid-4">
+          <div className="metric-tile">
+            <div className="metric-label">防休眠策略</div>
+            <div className="metric-value" style={{ fontSize: 15 }}>
+              {overview?.systemTuning.sleepDisabled ? '永不休眠' : '系统默认'}
+            </div>
+            <div className="metric-sub">AC 休眠超时 = 0</div>
+          </div>
+          <div className="metric-tile">
+            <div className="metric-label">拥塞控制算法</div>
+            <div className="metric-value" style={{ fontSize: 15 }}>
+              {overview?.systemTuning.tcpCongestionProvider ?? '--'}
+            </div>
+            <div className="metric-sub">推荐 CUBIC / CTCP</div>
+          </div>
+          <div className="metric-tile">
+            <div className="metric-label">接收窗口自动调优</div>
+            <div className="metric-value" style={{ fontSize: 15 }}>
+              {overview?.systemTuning.tcpAutoTuning ?? '--'}
+            </div>
+            <div className="metric-sub">推荐 Normal</div>
+          </div>
+          <div className="metric-tile">
+            <div className="metric-label">Timestamps / ECN</div>
+            <div className="metric-value" style={{ fontSize: 14 }}>
+              {overview?.systemTuning.tcpTimestamps ?? '--'} /{' '}
+              {overview?.systemTuning.tcpEcnCapability ?? '--'}
+            </div>
+            <div className="metric-sub">推荐 Enabled / Disabled</div>
+          </div>
+        </div>
+
+        <div>
+          <button className="btn btn-primary" onClick={handleApplySystemTuning} disabled={busy}>
+            一键应用跨国弱网 TCP 与防休眠调优
+          </button>
         </div>
       </div>
     </div>

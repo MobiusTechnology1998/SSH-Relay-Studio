@@ -44,6 +44,9 @@ const DEFAULT_TUNNEL_STATUS: TunnelStatus = {
   pid: null,
   connectedSince: null,
   reconnectCount: 0,
+  nextRetryAt: null,
+  lastHealthCheckAt: null,
+  lastHealthLatencyMs: null,
   lastError: null,
   diagnosticHint: null,
 };

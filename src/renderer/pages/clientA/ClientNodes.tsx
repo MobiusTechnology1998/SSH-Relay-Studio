@@ -25,6 +25,10 @@ function createEmptyNode(): NodeProfile {
     compression: false,
     serverAliveInterval: 15,
     serverAliveCountMax: 3,
+    forceIpv4: true,
+    preferFastCipher: true,
+    healthCheckEnabled: true,
+    healthCheckIntervalSec: 25,
     notes: '',
   };
 }
@@ -377,6 +381,60 @@ export const ClientNodes: React.FC<ClientNodesProps> = ({
                 />
                 <span className="field-hint">连续无响应此次数后自动触发重连（默认 3 次）</span>
               </div>
+            </div>
+
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={editing.preferFastCipher !== false}
+                onChange={(e) => setEditing({ ...editing, preferFastCipher: e.target.checked })}
+              />
+              <span>优先高速加密套件（AES-128-GCM / ChaCha20，利用 AES-NI 硬件加速提速）</span>
+            </label>
+
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={editing.forceIpv4 !== false}
+                onChange={(e) => setEditing({ ...editing, forceIpv4: e.target.checked })}
+              />
+              <span>强制使用 IPv4（AddressFamily=inet，避免跨国链路 IPv6 绕路与回退卡顿）</span>
+            </label>
+
+            <div className="grid-2">
+              <div className="field" style={{ justifyContent: 'center' }}>
+                <label className="checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={editing.healthCheckEnabled !== false}
+                    onChange={(e) =>
+                      setEditing({ ...editing, healthCheckEnabled: e.target.checked })
+                    }
+                  />
+                  <span>启用端到端主动探活（自动检测假死并重建）</span>
+                </label>
+              </div>
+              {editing.healthCheckEnabled !== false && (
+                <div className="field">
+                  <label className="field-label">探活周期（秒，默认 25）</label>
+                  <input
+                    className="input mono"
+                    type="number"
+                    min={10}
+                    max={120}
+                    value={editing.healthCheckIntervalSec ?? 25}
+                    onChange={(e) =>
+                      setEditing({
+                        ...editing,
+                        healthCheckIntervalSec: Math.max(
+                          10,
+                          Math.min(120, Number(e.target.value) || 25)
+                        ),
+                      })
+                    }
+                  />
+                </div>
+              )}
             </div>
 
             <label className="checkbox-row">

@@ -257,6 +257,21 @@ export const ClientTools: React.FC<ClientToolsProps> = ({
         <label className="checkbox-row">
           <input
             type="checkbox"
+            checked={settings.browser.disableQuic !== false}
+            onChange={(e) =>
+              onUpdateSettings({
+                browser: { ...settings.browser, disableQuic: e.target.checked },
+              })
+            }
+          />
+          <span>
+            推荐：SOCKS5 模式下禁用 QUIC / HTTP3（<code className="mono">--disable-quic</code>，避免访问 Cloudflare/Google/OpenAI 等站点时因 UDP 不可达导致超时回退，无警告横幅）
+          </span>
+        </label>
+
+        <label className="checkbox-row">
+          <input
+            type="checkbox"
             checked={settings.browser.useHostResolverRules}
             onChange={(e) =>
               onUpdateSettings({

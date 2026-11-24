@@ -49,12 +49,27 @@ export function buildSshTunnelArgs(node: NodeProfile, resolvedKeyPath?: string):
     '-o',
     'ExitOnForwardFailure=yes',
     '-o',
-    'BatchMode=yes'
+    'BatchMode=yes',
+    '-o',
+    'PreferredAuthentications=publickey',
+    '-o',
+    'RekeyLimit=1G 1h'
   );
+
+  if (node.preferFastCipher !== false) {
+    args.push(
+      '-o',
+      'Ciphers=aes128-gcm@openssh.com,chacha20-poly1305@openssh.com,aes256-gcm@openssh.com'
+    );
+  }
+
+  if (node.forceIpv4 !== false) {
+    args.push('-o', 'AddressFamily=inet');
+  }
 
   const keyPath = (resolvedKeyPath || node.privateKeyPath || '').trim();
   if (keyPath) {
-    args.push('-i', keyPath);
+    args.push('-o', 'IdentitiesOnly=yes', '-i', keyPath);
   }
 
   args.push(`${node.username}@${node.host}`);
@@ -73,8 +88,9 @@ export function formatSshCommandPreview(node: NodeProfile, resolvedKeyPath?: str
 
 /**
  * Builds Chromium (Edge / Chrome) arguments for isolated full-site proxy browsing.
- * Per ssh.md 5.3 & 6: avoids `--host-resolver-rules` by default to prevent warning banners,
- * and allows opting in for strict corporate intranets.
+ * - Avoids `--host-resolver-rules` by default to prevent warning banners.
+ * - Adds `--disable-quic` by default in SOCKS5 mode because OpenSSH `-D` only tunnels TCP
+ *   and cannot carry HTTP/3 (QUIC/UDP), preventing 200ms~1s fallback delays on Cloudflare/Google/OpenAI.
  */
 export function buildBrowserLaunchArgs(
   node: Pick<NodeProfile, 'mode' | 'localPort'>,
@@ -86,6 +102,10 @@ export function buildBrowserLaunchArgs(
     `--proxy-server=${proxyScheme}://127.0.0.1:${node.localPort}`,
     `--user-data-dir=${resolvedUserDataDir}`,
   ];
+
+  if (node.mode === 'socks5' && prefs.disableQuic !== false) {
+    args.push('--disable-quic');
+  }
 
   if (prefs.useHostResolverRules) {
     args.push('--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1');
@@ -130,6 +150,49 @@ export function buildTerminalProxySnippets(
 }
 
 /**
+ * Computes reconnect backoff delay (ms) tuned for cross-border weak networks:
+ * 1st retry: 1s (instant recovery from transient RST/drop)
+ * 2nd retry: 2s
+ * 3rd retry: 4s
+ * 4th retry: 8s
+ * 5th+ retry: 15s cap
+ */
+export function computeReconnectDelayMs(attempt: number, jitterRatio = 0.15): number {
+  const schedule = [1000, 2000, 4000, 8000, 15000];
+  const idx = Math.max(0, Math.min(schedule.length - 1, Math.floor(attempt) - 1));
+  const base = schedule[idx];
+  if (jitterRatio <= 0) return base;
+  const delta = base * jitterRatio;
+  const randomized = base + (Math.random() * 2 - 1) * delta;
+  return Math.max(500, Math.round(randomized));
+}
+
+/**
+ * Returns true for non-recoverable SSH auth/config errors where blind auto-reconnecting
+ * would only spam failed connections until the user fixes credentials or host keys.
+ */
+export function isHardSshAuthFailure(reason: string): boolean {
+  const lower = reason.toLowerCase();
+  if (
+    lower.includes('host key verification failed') ||
+    lower.includes('remote host identification has changed') ||
+    lower.includes('permission denied (publickey') ||
+    lower.includes('unprotected private key file') ||
+    lower.includes('bad permissions') ||
+    lower.includes('no matching cipher found')
+  ) {
+    return true;
+  }
+  if (
+    lower.includes('no such file or directory') &&
+    (lower.includes('identity') || lower.includes('.ssh') || lower.includes('id_'))
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * Translates common OpenSSH stderr outputs into actionable Chinese diagnostic hints
  * grounded directly in ssh.md troubleshooting rules.
  */
@@ -146,6 +209,14 @@ export function diagnoseSshError(stderr: string): string | null {
 
   if (lower.includes('permission denied (publickey')) {
     return '公钥认证被拒绝：请确认已将设备 A 公钥追加到设备 B 的 C:\\ProgramData\\ssh\\administrators_authorized_keys，并在 B 端执行了 icacls 权限收紧。';
+  }
+
+  if (lower.includes('unprotected private key file') || lower.includes('bad permissions')) {
+    return '本地私钥文件权限过宽被 OpenSSH 拒绝：请仅保留当前用户对私钥文件的读取权限，或重新生成密钥对。';
+  }
+
+  if (lower.includes('no matching cipher found')) {
+    return '服务端不支持高速加密套件（可能 OpenSSH 版本过老）：请在节点设置中取消勾选「优先高速加密套件」或升级设备 B OpenSSH。';
   }
 
   if (lower.includes('connection refused')) {
@@ -173,7 +244,7 @@ export function diagnoseSshError(stderr: string): string | null {
     lower.includes('broken pipe') ||
     lower.includes('client_loop: send disconnect')
   ) {
-    return '隧道 TCP 连接被对端或中间网络重置（Connection reset）：已自动触发重连。若频繁发生，建议在设备 B 开启 sshd 服务端保活（ClientAliveInterval）并确认节点未开启 SSH 压缩（-C）。';
+    return '隧道 TCP 连接被对端或中间网络重置（Connection reset）：已自动触发快速重连。若频繁发生，建议在设备 B 开启 sshd 服务端保活（ClientAliveInterval）并确认节点未开启 SSH 压缩（-C）。';
   }
 
   return null;

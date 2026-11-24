@@ -3,9 +3,11 @@ import {
   buildBrowserLaunchArgs,
   buildSshTunnelArgs,
   buildTerminalProxySnippets,
+  computeReconnectDelayMs,
   decodeOpenSshOctalEscapes,
   diagnoseSshError,
   formatKnownHostsTarget,
+  isHardSshAuthFailure,
   isNonFatalChannelOpenError,
 } from '../src/shared/commandBuilders';
 import {
@@ -35,7 +37,7 @@ const BASE_BROWSER: BrowserPrefs = {
 };
 
 describe('commandBuilders', () => {
-  it('builds optimized SOCKS5 dynamic tunnel args without -C by default', () => {
+  it('builds optimized SOCKS5 dynamic tunnel args with weak-network tuning by default', () => {
     const args = buildSshTunnelArgs(BASE_NODE, 'C:\\Users\\A\\.ssh\\id_ed25519');
     expect(args).toContain('-p');
     expect(args).toContain('53622');
@@ -49,19 +51,30 @@ describe('commandBuilders', () => {
     expect(args).toContain('ConnectTimeout=10');
     expect(args).toContain('ExitOnForwardFailure=yes');
     expect(args).toContain('BatchMode=yes');
+    expect(args).toContain('PreferredAuthentications=publickey');
+    expect(args).toContain('RekeyLimit=1G 1h');
+    expect(args).toContain(
+      'Ciphers=aes128-gcm@openssh.com,chacha20-poly1305@openssh.com,aes256-gcm@openssh.com'
+    );
+    expect(args).toContain('AddressFamily=inet');
+    expect(args).toContain('IdentitiesOnly=yes');
     expect(args[args.length - 1]).toBe('Administrator@203.0.113.10');
   });
 
-  it('supports optional SSH compression (-C) and custom keepalive settings', () => {
+  it('supports opting out of fast cipher / IPv4 and opting into -C compression', () => {
     const args = buildSshTunnelArgs({
       ...BASE_NODE,
       compression: true,
       serverAliveInterval: 20,
       serverAliveCountMax: 5,
+      preferFastCipher: false,
+      forceIpv4: false,
     });
     expect(args).toContain('-C');
     expect(args).toContain('ServerAliveInterval=20');
     expect(args).toContain('ServerAliveCountMax=5');
+    expect(args.some((a) => a.startsWith('Ciphers='))).toBe(false);
+    expect(args).not.toContain('AddressFamily=inet');
   });
 
   it('builds local port forward (-L) args when Device B uses upstream Clash/v2rayN', () => {
@@ -76,11 +89,28 @@ describe('commandBuilders', () => {
     expect(args).not.toContain('-D');
   });
 
-  it('builds isolated browser args without --host-resolver-rules by default', () => {
+  it('builds isolated browser args with --disable-quic in socks5 mode and without --host-resolver-rules by default', () => {
     const args = buildBrowserLaunchArgs(BASE_NODE, BASE_BROWSER, 'C:\\Users\\A\\AppData\\Local\\Edge');
     expect(args).toContain('--proxy-server=socks5://127.0.0.1:1080');
     expect(args).toContain('--user-data-dir=C:\\Users\\A\\AppData\\Local\\Edge');
+    expect(args).toContain('--disable-quic');
     expect(args.some((a) => a.includes('--host-resolver-rules'))).toBe(false);
+  });
+
+  it('omits --disable-quic when explicitly disabled or in localForward mode', () => {
+    const optOut = buildBrowserLaunchArgs(
+      BASE_NODE,
+      { ...BASE_BROWSER, disableQuic: false },
+      'C:\\Edge'
+    );
+    expect(optOut).not.toContain('--disable-quic');
+
+    const localFwd = buildBrowserLaunchArgs(
+      { mode: 'localForward', localPort: 7890 },
+      BASE_BROWSER,
+      'C:\\Edge'
+    );
+    expect(localFwd).not.toContain('--disable-quic');
   });
 
   it('includes --host-resolver-rules only when explicitly opted in', () => {
@@ -90,6 +120,30 @@ describe('commandBuilders', () => {
       'C:\\Edge'
     );
     expect(args.some((a) => a.startsWith('--host-resolver-rules='))).toBe(true);
+  });
+
+  it('computes exponential backoff reconnect delays with cap and jitter bounds', () => {
+    expect(computeReconnectDelayMs(1, 0)).toBe(1000);
+    expect(computeReconnectDelayMs(2, 0)).toBe(2000);
+    expect(computeReconnectDelayMs(3, 0)).toBe(4000);
+    expect(computeReconnectDelayMs(4, 0)).toBe(8000);
+    expect(computeReconnectDelayMs(5, 0)).toBe(15000);
+    expect(computeReconnectDelayMs(12, 0)).toBe(15000);
+
+    for (let i = 0; i < 20; i++) {
+      const jittered = computeReconnectDelayMs(3, 0.15);
+      expect(jittered).toBeGreaterThanOrEqual(3400);
+      expect(jittered).toBeLessThanOrEqual(4600);
+    }
+  });
+
+  it('distinguishes hard SSH auth/config failures from transient network drops', () => {
+    expect(isHardSshAuthFailure('Host key verification failed.')).toBe(true);
+    expect(isHardSshAuthFailure('Permission denied (publickey).')).toBe(true);
+    expect(isHardSshAuthFailure('Unable to negotiate: no matching cipher found.')).toBe(true);
+    expect(isHardSshAuthFailure('Identity file C:\\Users\\A\\.ssh\\id_ed25519: No such file or directory')).toBe(true);
+    expect(isHardSshAuthFailure('client_loop: send disconnect: Connection reset')).toBe(false);
+    expect(isHardSshAuthFailure('Connection timed out')).toBe(false);
   });
 
   it('resolves default browser profile dirs without -GPT suffix and expands Windows env vars', () => {
@@ -135,6 +189,7 @@ describe('commandBuilders', () => {
     expect(diagnoseSshError('Permission denied (publickey).')).toContain('administrators_authorized_keys');
     expect(diagnoseSshError('Connection refused')).toContain('sshd');
     expect(diagnoseSshError('client_loop: send disconnect: Connection reset')).toContain('Connection reset');
+    expect(diagnoseSshError('no matching cipher found')).toContain('高速加密套件');
   });
 
   it('formats known_hosts target properly for port 22 and custom ports', () => {

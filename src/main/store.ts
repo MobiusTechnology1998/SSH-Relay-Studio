@@ -16,6 +16,7 @@ export function getDefaultSettings(): AppSettings {
       customBrowserPath: '',
       userDataDir: '',
       useHostResolverRules: false,
+      disableQuic: true,
       startUrl: 'https://ipinfo.io',
     },
     serverPrefs: {

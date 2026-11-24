@@ -3,27 +3,38 @@ import os from 'os';
 import path from 'path';
 import {
   buildSshTunnelArgs,
+  computeReconnectDelayMs,
   decodeSshOutputChunk,
   diagnoseSshError,
+  isHardSshAuthFailure,
   isNonFatalChannelOpenError,
 } from '../../shared/commandBuilders';
 import type { ActionResult, NodeProfile, TunnelStatus } from '../../shared/types';
 import { logger } from '../logger';
 import {
-  isLocalPortListening,
-  resolveOpenSshBinary,
-  IS_WINDOWS,
   execCmd,
+  isLocalPortListening,
+  IS_WINDOWS,
+  resolveOpenSshBinary,
+  testTcpConnection,
 } from '../platform/shell';
+import { probeTunnelHealth } from './healthProbe';
 
 type StatusListener = (status: TunnelStatus) => void;
 
-const RECONNECT_DELAY_MS = 5000;
+const STABLE_RESET_MS = 60_000;
+const HEALTH_PROBE_TIMEOUT_MS = 8000;
+const HEALTH_FAIL_THRESHOLD = 2;
 
 class TunnelManager {
   private child: ChildProcess | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private listenPollTimer: NodeJS.Timeout | null = null;
+  private healthCheckTimer: NodeJS.Timeout | null = null;
+  private stableResetTimer: NodeJS.Timeout | null = null;
+  private resumeProbeTimer: NodeJS.Timeout | null = null;
+  private healthCheckInFlight = false;
+  private consecutiveHealthFailures = 0;
   private desiredRunning = false;
   private activeNode: NodeProfile | null = null;
   private listeners = new Set<StatusListener>();
@@ -38,6 +49,9 @@ class TunnelManager {
     pid: null,
     connectedSince: null,
     reconnectCount: 0,
+    nextRetryAt: null,
+    lastHealthCheckAt: null,
+    lastHealthLatencyMs: null,
     lastError: null,
     diagnosticHint: null,
   };
@@ -74,6 +88,20 @@ class TunnelManager {
       clearInterval(this.listenPollTimer);
       this.listenPollTimer = null;
     }
+    if (this.healthCheckTimer) {
+      clearInterval(this.healthCheckTimer);
+      this.healthCheckTimer = null;
+    }
+    if (this.stableResetTimer) {
+      clearTimeout(this.stableResetTimer);
+      this.stableResetTimer = null;
+    }
+    if (this.resumeProbeTimer) {
+      clearTimeout(this.resumeProbeTimer);
+      this.resumeProbeTimer = null;
+    }
+    this.healthCheckInFlight = false;
+    this.consecutiveHealthFailures = 0;
   }
 
   private resolveKeyPath(node: NodeProfile): string {
@@ -81,6 +109,23 @@ class TunnelManager {
       return node.privateKeyPath.trim();
     }
     return path.join(os.homedir(), '.ssh', 'id_ed25519');
+  }
+
+  private async killChildProcess(child: ChildProcess | null): Promise<void> {
+    if (!child || !child.pid) return;
+    try {
+      if (IS_WINDOWS) {
+        await execCmd('taskkill', ['/F', '/T', '/PID', String(child.pid)], { timeoutMs: 5000 });
+      } else {
+        child.kill('SIGTERM');
+      }
+    } catch {
+      try {
+        child.kill();
+      } catch {
+        // Ignore already exited
+      }
+    }
   }
 
   public async start(node: NodeProfile): Promise<ActionResult<TunnelStatus>> {
@@ -106,6 +151,9 @@ class TunnelManager {
         localPort: node.localPort,
         pid: null,
         connectedSince: null,
+        nextRetryAt: null,
+        lastHealthCheckAt: null,
+        lastHealthLatencyMs: null,
         lastError: msg,
         diagnosticHint: '可点击「清理残留 ssh.exe」按钮，或在节点配置中修改本地端口（如 1081）。',
       });
@@ -123,12 +171,76 @@ class TunnelManager {
       pid: null,
       connectedSince: null,
       reconnectCount: 0,
+      nextRetryAt: null,
+      lastHealthCheckAt: null,
+      lastHealthLatencyMs: null,
       lastError: null,
       diagnosticHint: null,
     });
 
     this.spawnTunnelProcess(false);
     return { ok: true, message: `正在启动隧道：${node.name}`, data: this.getStatus() };
+  }
+
+  private startHealthCheckLoop(child: ChildProcess, node: NodeProfile): void {
+    if (node.healthCheckEnabled === false) return;
+
+    const rawSec = node.healthCheckIntervalSec;
+    const intervalSec =
+      typeof rawSec === 'number' && Number.isFinite(rawSec) && rawSec >= 10 && rawSec <= 120
+        ? Math.round(rawSec)
+        : 25;
+
+    this.consecutiveHealthFailures = 0;
+
+    // Run a quick initial probe after 3s so UI displays real A<->B tunnel RTT promptly
+    const runProbe = async () => {
+      if (!this.desiredRunning || this.child !== child || this.healthCheckInFlight) {
+        return;
+      }
+      this.healthCheckInFlight = true;
+      try {
+        const res = await probeTunnelHealth(
+          node.mode,
+          node.localPort,
+          node.sshPort,
+          HEALTH_PROBE_TIMEOUT_MS
+        );
+        if (!this.desiredRunning || this.child !== child) return;
+
+        if (res.ok) {
+          this.consecutiveHealthFailures = 0;
+          this.emit({
+            lastHealthCheckAt: Date.now(),
+            lastHealthLatencyMs: res.latencyMs,
+          });
+        } else {
+          this.consecutiveHealthFailures += 1;
+          logger.warn(
+            'tunnel',
+            `端到端探活失败 (${this.consecutiveHealthFailures}/${HEALTH_FAIL_THRESHOLD}): ${res.detail}`
+          );
+          if (this.consecutiveHealthFailures >= HEALTH_FAIL_THRESHOLD) {
+            logger.warn(
+              'tunnel',
+              `连续 ${HEALTH_FAIL_THRESHOLD} 次探活超时，判定隧道已假死，主动终止并触发快速重连...`
+            );
+            this.stderrBuffer = '端到端健康探活连续失败（隧道假死）';
+            await this.killChildProcess(child);
+          }
+        }
+      } finally {
+        this.healthCheckInFlight = false;
+      }
+    };
+
+    setTimeout(() => {
+      void runProbe();
+    }, 3000);
+
+    this.healthCheckTimer = setInterval(() => {
+      void runProbe();
+    }, intervalSec * 1000);
   }
 
   private spawnTunnelProcess(isReconnect: boolean): void {
@@ -160,6 +272,7 @@ class TunnelManager {
         state: 'error',
         pid: null,
         connectedSince: null,
+        nextRetryAt: null,
         lastError: msg,
         diagnosticHint: '请确认 Windows 已内置 OpenSSH Client（C:\\Windows\\System32\\OpenSSH\\ssh.exe）。',
       });
@@ -171,6 +284,7 @@ class TunnelManager {
     this.emit({
       state: isReconnect ? 'reconnecting' : 'connecting',
       pid: child.pid ?? null,
+      nextRetryAt: null,
     });
 
     child.stdout?.on('data', (chunk: Buffer) => {
@@ -236,15 +350,34 @@ class TunnelManager {
           state: 'connected',
           pid: child.pid ?? null,
           connectedSince: Date.now(),
+          nextRetryAt: null,
           lastError: null,
           diagnosticHint: null,
         });
+
+        // Start active end-to-end health probe to detect frozen/zombie tunnels
+        this.startHealthCheckLoop(child, node);
+
+        // Reset backoff counter after stable operation so future blips recover in ~1s
+        this.stableResetTimer = setTimeout(() => {
+          this.stableResetTimer = null;
+          if (this.desiredRunning && this.child === child && this.status.state === 'connected') {
+            if (this.status.reconnectCount > 0) {
+              this.emit({ reconnectCount: 0 });
+            }
+          }
+        }, STABLE_RESET_MS);
       } else if (pollAttempts > 40) {
-        // 20 seconds elapsed without opening port
+        // 20 seconds elapsed without opening port: kill hung ssh.exe to trigger backoff reconnect
         if (this.listenPollTimer) {
           clearInterval(this.listenPollTimer);
           this.listenPollTimer = null;
         }
+        logger.warn('tunnel', 'SSH 握手超过 20 秒未打开本地监听端口，主动中止并尝试重连...');
+        if (!this.stderrBuffer.trim()) {
+          this.stderrBuffer = 'Connection timed out (SSH 握手超时未监听本地端口)';
+        }
+        await this.killChildProcess(child);
       }
     }, 500);
 
@@ -265,6 +398,8 @@ class TunnelManager {
           state: 'disconnected',
           pid: null,
           connectedSince: null,
+          nextRetryAt: null,
+          lastHealthLatencyMs: null,
         });
         return;
       }
@@ -276,32 +411,15 @@ class TunnelManager {
     });
   }
 
-  private handleUnexpectedExit(_code: number, reason: string): void {
-    const hint = diagnoseSshError(reason);
+  private scheduleReconnect(reason: string): void {
     const nextReconnectCount = this.status.reconnectCount + 1;
-
-    // Fatal config/auth errors shouldn't spam infinite reconnects without telling user;
-    // still keep watchdog for network drops, but pause on explicit host key / key missing errors
-    const isHardAuthFailure =
-      reason.toLowerCase().includes('host key verification failed') ||
-      reason.toLowerCase().includes('no such file or directory');
-
-    if (isHardAuthFailure) {
-      this.desiredRunning = false;
-      logger.error('tunnel', `检测到认证/指纹错误，已暂停自动重连: ${reason}`);
-      this.emit({
-        state: 'error',
-        pid: null,
-        connectedSince: null,
-        lastError: reason,
-        diagnosticHint: hint,
-      });
-      return;
-    }
+    const delayMs = computeReconnectDelayMs(nextReconnectCount);
+    const nextRetryAt = Date.now() + delayMs;
+    const hint = diagnoseSshError(reason);
 
     logger.warn(
       'tunnel',
-      `隧道已断开（${reason}），将于 ${RECONNECT_DELAY_MS / 1000} 秒后执行第 ${nextReconnectCount} 次自动重连...`
+      `隧道已断开（${reason}），将于 ${(delayMs / 1000).toFixed(1)} 秒后执行第 ${nextReconnectCount} 次自动重连...`
     );
 
     this.emit({
@@ -309,16 +427,105 @@ class TunnelManager {
       pid: null,
       connectedSince: null,
       reconnectCount: nextReconnectCount,
+      nextRetryAt,
+      lastHealthLatencyMs: null,
       lastError: reason,
       diagnosticHint: hint,
     });
 
-    this.reconnectTimer = setTimeout(() => {
+    this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = null;
-      if (this.desiredRunning) {
-        this.spawnTunnelProcess(true);
+      if (!this.desiredRunning || !this.activeNode) return;
+
+      // On subsequent retries (attempt >= 2), run a lightweight TCP pre-check first
+      // to avoid spawning ssh.exe repeatedly while the machine is completely offline.
+      if (nextReconnectCount >= 2) {
+        const probe = await testTcpConnection(this.activeNode.host, this.activeNode.sshPort, 4000);
+        if (!this.desiredRunning || !this.activeNode) return;
+        if (!probe.reachable) {
+          this.scheduleReconnect(`网络预检不可达: ${probe.detail}`);
+          return;
+        }
       }
-    }, RECONNECT_DELAY_MS);
+
+      this.spawnTunnelProcess(true);
+    }, delayMs);
+  }
+
+  private handleUnexpectedExit(_code: number, reason: string): void {
+    const hint = diagnoseSshError(reason);
+
+    if (isHardSshAuthFailure(reason)) {
+      this.desiredRunning = false;
+      logger.error('tunnel', `检测到认证/指纹/配置错误，已暂停自动重连: ${reason}`);
+      this.emit({
+        state: 'error',
+        pid: null,
+        connectedSince: null,
+        nextRetryAt: null,
+        lastHealthLatencyMs: null,
+        lastError: reason,
+        diagnosticHint: hint,
+      });
+      return;
+    }
+
+    this.scheduleReconnect(reason);
+  }
+
+  /**
+   * Called when OS wakes from sleep/hibernate (Electron powerMonitor 'resume').
+   * Proactively tests or immediately rebuilds the tunnel instead of waiting 45s+ for keepalive timeout.
+   */
+  public handleSystemResume(): void {
+    if (!this.desiredRunning || !this.activeNode) return;
+
+    if (this.reconnectTimer) {
+      logger.info('tunnel', '检测到系统休眠唤醒，取消退避等待并立即尝试重连...');
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+      this.emit({ reconnectCount: 0, nextRetryAt: null });
+      this.resumeProbeTimer = setTimeout(() => {
+        this.resumeProbeTimer = null;
+        if (this.desiredRunning) {
+          this.spawnTunnelProcess(true);
+        }
+      }, 1500);
+      return;
+    }
+
+    if (this.child && this.status.state === 'connected') {
+      const targetChild = this.child;
+      const targetNode = this.activeNode;
+      logger.info('tunnel', '检测到系统休眠唤醒，正在快速校验隧道连通性...');
+      if (this.resumeProbeTimer) {
+        clearTimeout(this.resumeProbeTimer);
+      }
+      // Wait 1.5s for Wi-Fi / NIC to re-associate after wake, then verify end-to-end liveness
+      this.resumeProbeTimer = setTimeout(async () => {
+        this.resumeProbeTimer = null;
+        if (!this.desiredRunning || this.child !== targetChild) return;
+        const probe = await probeTunnelHealth(
+          targetNode.mode,
+          targetNode.localPort,
+          targetNode.sshPort,
+          5000
+        );
+        if (!this.desiredRunning || this.child !== targetChild) return;
+        if (probe.ok) {
+          logger.success('tunnel', `休眠唤醒校验通过，隧道依然畅通 (${probe.latencyMs}ms)`);
+          this.emit({
+            lastHealthCheckAt: Date.now(),
+            lastHealthLatencyMs: probe.latencyMs,
+          });
+        } else {
+          logger.warn('tunnel', `休眠唤醒后隧道已失效（${probe.detail}），立即重建连接...`);
+          this.emit({ reconnectCount: 0 });
+          this.stderrBuffer = '系统休眠唤醒后连接失效';
+          await this.killChildProcess(targetChild);
+        }
+      }, 1500);
+    }
   }
 
   public async stop(silent = false): Promise<ActionResult<TunnelStatus>> {
@@ -328,21 +535,7 @@ class TunnelManager {
     const child = this.child;
     this.child = null;
 
-    if (child && child.pid) {
-      try {
-        if (IS_WINDOWS) {
-          await execCmd('taskkill', ['/F', '/T', '/PID', String(child.pid)], { timeoutMs: 5000 });
-        } else {
-          child.kill('SIGTERM');
-        }
-      } catch {
-        try {
-          child.kill();
-        } catch {
-          // Ignore already exited
-        }
-      }
-    }
+    await this.killChildProcess(child);
 
     if (!silent) {
       logger.info('tunnel', '已手动断开隧道连接并停止自动守护。');
@@ -353,6 +546,9 @@ class TunnelManager {
       pid: null,
       connectedSince: null,
       reconnectCount: 0,
+      nextRetryAt: null,
+      lastHealthCheckAt: null,
+      lastHealthLatencyMs: null,
       lastError: null,
       diagnosticHint: null,
     });

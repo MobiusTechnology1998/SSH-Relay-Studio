@@ -35,7 +35,7 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
   const [now, setNow] = useState(Date.now());
 
   useEffect(() => {
-    if (tunnelStatus.state !== 'connected') return;
+    if (tunnelStatus.state !== 'connected' && tunnelStatus.state !== 'reconnecting') return;
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
   }, [tunnelStatus.state]);
@@ -45,12 +45,20 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
     tunnelStatus.state === 'connecting' ||
     tunnelStatus.state === 'reconnecting';
 
+  const retryCountdownSec =
+    tunnelStatus.state === 'reconnecting' && tunnelStatus.nextRetryAt
+      ? Math.max(0, Math.ceil((tunnelStatus.nextRetryAt - now) / 1000))
+      : null;
+
   const statusMeta = {
     disconnected: { label: '隧道未连接', badge: 'neutral' as const },
     connecting: { label: '正在建立 SSH 隧道...', badge: 'warn' as const },
     connected: { label: '加密隧道运行中', badge: 'success' as const },
     reconnecting: {
-      label: `断线自动重连中（第 ${tunnelStatus.reconnectCount} 次）`,
+      label:
+        retryCountdownSec !== null && retryCountdownSec > 0
+          ? `自动重连中（第 ${tunnelStatus.reconnectCount} 次，${retryCountdownSec}s 后重试）`
+          : `断线自动重连中（第 ${tunnelStatus.reconnectCount} 次）`,
       badge: 'warn' as const,
     },
     error: { label: '连接异常', badge: 'danger' as const },
@@ -111,13 +119,16 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
     onNotify(res.ok ? 'success' : 'error', res.message);
   };
 
+  const aliveInterval = activeNode?.serverAliveInterval ?? 15;
+  const aliveCountMax = activeNode?.serverAliveCountMax ?? 3;
+
   return (
     <div className="stack-md">
       <div className="page-header">
         <div>
           <h1 className="page-title">隧道控制台</h1>
           <p className="page-desc">
-            一键管理加密隧道与后台守护进程（内置 5 秒断线自愈，无需手动维护 VBS/BAT 脚本）
+            一键管理加密隧道与弱网自愈守护（主动假死探活、休眠唤醒恢复、1s 起步指数退避重连）
           </p>
         </div>
         <div className="header-actions">
@@ -225,12 +236,20 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
           <div className="metric-value">
             {formatDuration(tunnelStatus.connectedSince, now)}
           </div>
-          <div className="metric-sub">心跳保活：30s × 3</div>
+          <div className="metric-sub">
+            心跳保活：{aliveInterval}s × {aliveCountMax}
+          </div>
         </div>
         <div className="metric-tile">
-          <div className="metric-label">进程 PID</div>
-          <div className="metric-value">{tunnelStatus.pid ?? '--'}</div>
-          <div className="metric-sub">自动重连次数：{tunnelStatus.reconnectCount}</div>
+          <div className="metric-label">隧道端到端延迟</div>
+          <div className="metric-value">
+            {tunnelStatus.lastHealthLatencyMs !== null
+              ? `${tunnelStatus.lastHealthLatencyMs} ms`
+              : '--'}
+          </div>
+          <div className="metric-sub">
+            PID: {tunnelStatus.pid ?? '--'} · 重连: {tunnelStatus.reconnectCount} 次
+          </div>
         </div>
         <div className="metric-tile">
           <div className="metric-label">隔离浏览器</div>
@@ -241,7 +260,11 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
               ? 'Chrome'
               : '自定义'}
           </div>
-          <div className="metric-sub">独立用户目录，全站代理</div>
+          <div className="metric-sub">
+            {settings.browser.disableQuic !== false
+              ? '已禁 QUIC（降低 HTTP/3 回退延迟）'
+              : '独立用户目录，全站代理'}
+          </div>
         </div>
       </div>
 
