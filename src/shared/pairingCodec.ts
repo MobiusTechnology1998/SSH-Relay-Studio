@@ -1,4 +1,4 @@
-import type { PairingPayload } from './types';
+import type { PairingPayload, QuicPairingInfo } from './types';
 
 const TOKEN_PREFIX = 'SSHR1:';
 
@@ -22,6 +22,31 @@ function fromBase64Utf8(b64url: string): string {
   return new TextDecoder().decode(bytes);
 }
 
+function sanitizeQuicInfo(raw: unknown): QuicPairingInfo | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const q = raw as Record<string, unknown>;
+  const udpPort = Number(q.udpPort);
+  const authToken = typeof q.authToken === 'string' ? q.authToken.trim() : '';
+  const certPinSha256 = typeof q.certPinSha256 === 'string' ? q.certPinSha256.trim() : '';
+  const sni = typeof q.sni === 'string' && q.sni.trim() ? q.sni.trim() : 'www.bing.com';
+  const obfsPassword =
+    typeof q.obfsPassword === 'string' && q.obfsPassword.trim()
+      ? q.obfsPassword.trim()
+      : undefined;
+
+  if (!Number.isInteger(udpPort) || udpPort < 1 || udpPort > 65535 || !authToken || !certPinSha256) {
+    return undefined;
+  }
+
+  return {
+    udpPort,
+    authToken,
+    certPinSha256,
+    sni,
+    obfsPassword,
+  };
+}
+
 export function encodePairingToken(payload: PairingPayload): string {
   if (!payload.host.trim()) {
     throw new Error('中转端主机 IP 或域名不能为空');
@@ -29,6 +54,7 @@ export function encodePairingToken(payload: PairingPayload): string {
   if (!Number.isInteger(payload.sshPort) || payload.sshPort < 1 || payload.sshPort > 65535) {
     throw new Error('SSH 端口无效');
   }
+  const quic = sanitizeQuicInfo(payload.quic);
   const json = JSON.stringify({
     version: 1,
     name: payload.name.trim() || `中转节点 (${payload.host.trim()})`,
@@ -36,6 +62,7 @@ export function encodePairingToken(payload: PairingPayload): string {
     sshPort: payload.sshPort,
     username: payload.username.trim() || 'Administrator',
     hostPublicKey: payload.hostPublicKey?.trim() || undefined,
+    quic,
     createdAt: payload.createdAt || Date.now(),
   });
   return `${TOKEN_PREFIX}${toBase64Utf8(json)}`;
@@ -90,6 +117,7 @@ export function decodePairingToken(token: string): PairingPayload {
       typeof obj.hostPublicKey === 'string' && obj.hostPublicKey.trim()
         ? obj.hostPublicKey.trim()
         : undefined,
+    quic: sanitizeQuicInfo(obj.quic),
     createdAt: typeof obj.createdAt === 'number' ? obj.createdAt : Date.now(),
   };
 }

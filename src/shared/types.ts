@@ -2,6 +2,8 @@ export type AppRole = 'unset' | 'clientA' | 'serverB';
 
 export type TunnelMode = 'socks5' | 'localForward';
 
+export type TunnelEngineType = 'openssh' | 'hysteria2';
+
 export interface NodeProfile {
   id: string;
   name: string;
@@ -22,6 +24,16 @@ export interface NodeProfile {
   healthCheckIntervalSec?: number; // Default 25 seconds
   poolSize?: number; // Default 3 (1-6): parallel SSH tunnels behind local balancer to mitigate TCP HOL blocking
   rotationIntervalMin?: number; // Default 0 (disabled): periodic Make-Before-Break worker rotation in minutes
+  // Step 3: Pluggable Transport Engine (QUIC / Hysteria 2 for cross-border high-loss weak networks)
+  engine?: TunnelEngineType; // Default 'openssh'
+  autoFallbackToSsh?: boolean; // Default true: if UDP/QUIC is blocked, fall back seamlessly to OpenSSH pool
+  quicUdpPort?: number; // Default 53623
+  quicAuthToken?: string;
+  quicCertPinSha256?: string;
+  quicSni?: string; // Default 'www.bing.com'
+  quicObfsPassword?: string; // Optional Salamander obfuscation password
+  quicUpMbps?: number; // Default 50 (client upload Mbps for Brutal congestion control)
+  quicDownMbps?: number; // Default 200 (client download Mbps for Brutal congestion control)
   notes?: string;
 }
 
@@ -30,7 +42,7 @@ export interface BrowserPrefs {
   customBrowserPath: string;
   userDataDir: string; // Empty means default %LOCALAPPDATA%\Edge or Chrome
   useHostResolverRules: boolean; // Default false per ssh.md 5.3 & 6
-  disableQuic?: boolean; // Default true in SOCKS5 mode to avoid HTTP/3 UDP fallback latency
+  disableQuic?: boolean; // Default true in OpenSSH SOCKS5 mode to avoid HTTP/3 UDP fallback latency
   startUrl: string;
 }
 
@@ -41,11 +53,18 @@ export interface AppSettings {
   autoStart: boolean;
   autoConnectOnLaunch: boolean;
   minimizeToTray: boolean;
+  customOpenSshDir?: string; // Optional path to newer Win32-OpenSSH directory (v9.8+)
+  customHysteriaPath?: string; // Optional path to hysteria.exe binary
   browser: BrowserPrefs;
   serverPrefs: {
     targetPort: number;
     useAdminAuthorizedKeys: boolean;
     customAuthorizedKeysPath: string;
+    quicUdpPort?: number;
+    quicSni?: string;
+    quicMaxUpMbps?: number;
+    quicMaxDownMbps?: number;
+    quicEnableObfs?: boolean;
   };
 }
 
@@ -72,6 +91,8 @@ export interface TunnelStatus {
   nodeId: string | null;
   nodeName: string | null;
   mode: TunnelMode;
+  activeEngine: TunnelEngineType;
+  fallbackActive: boolean;
   localPort: number;
   pid: number | null;
   connectedSince: number | null;
@@ -97,6 +118,20 @@ export interface LogEntry {
   message: string;
 }
 
+export interface OpenSshVersionInfo {
+  raw: string;
+  version: string | null;
+  major: number | null;
+  minor: number | null;
+  isLegacy: boolean; // True when OpenSSH < 9.0 (e.g. Win10/Server 2019 built-in 7.7/8.1)
+}
+
+export interface BinaryStatusInfo {
+  installed: boolean;
+  path: string;
+  version: string | null;
+}
+
 export interface EnvironmentInfo {
   platform: NodeJS.Platform;
   isWindows: boolean;
@@ -107,6 +142,8 @@ export interface EnvironmentInfo {
   userDataDir: string;
   sshClientAvailable: boolean;
   sshClientPath: string;
+  sshClientVersion: OpenSshVersionInfo;
+  hysteriaClient: BinaryStatusInfo;
 }
 
 export interface KeyPairInfo {
@@ -158,6 +195,14 @@ export interface DetectedBrowser {
   exists: boolean;
 }
 
+export interface QuicPairingInfo {
+  udpPort: number;
+  authToken: string;
+  certPinSha256: string;
+  sni: string;
+  obfsPassword?: string;
+}
+
 export interface PairingPayload {
   version: 1;
   name: string;
@@ -165,6 +210,7 @@ export interface PairingPayload {
   sshPort: number;
   username: string;
   hostPublicKey?: string;
+  quic?: QuicPairingInfo;
   createdAt: number;
 }
 
@@ -178,6 +224,33 @@ export interface OpenSshServiceStatus {
   startType: string;
   failureRecoveryConfigured: boolean;
   failureRecoveryDetail: string;
+  sshdVersion?: OpenSshVersionInfo;
+}
+
+export interface QuicServerConfigInput {
+  udpPort: number;
+  sni: string;
+  maxUpMbps: number;
+  maxDownMbps: number;
+  enableObfs: boolean;
+}
+
+export interface QuicServerStatus {
+  binaryInstalled: boolean;
+  binaryPath: string;
+  binaryVersion: string | null;
+  configured: boolean;
+  running: boolean;
+  pid: number | null;
+  udpPort: number;
+  sni: string;
+  authToken: string;
+  obfsPassword: string;
+  certPinSha256: string;
+  maxUpMbps: number;
+  maxDownMbps: number;
+  startupTaskConfigured: boolean;
+  lastError: string | null;
 }
 
 export interface SshdConfigState {
@@ -257,6 +330,7 @@ export interface ServerOverview {
   firewallRules: FirewallRuleInfo[];
   updatePolicy: WindowsUpdatePolicyState;
   systemTuning: ServerSystemTuningState;
+  quicServer: QuicServerStatus;
   listeningPorts: string[];
   activeConnections: ActiveConnectionInfo[];
   detectedPublicIp: string | null;

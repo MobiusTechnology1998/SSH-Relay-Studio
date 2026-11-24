@@ -3,6 +3,8 @@ import crypto from 'crypto';
 import fs from 'fs';
 import net from 'net';
 import path from 'path';
+import { parseOpenSshVersion } from '../../shared/hysteriaConfig';
+import type { OpenSshVersionInfo } from '../../shared/types';
 
 export const IS_WINDOWS = process.platform === 'win32';
 
@@ -77,19 +79,57 @@ export async function runPowerShell(
   );
 }
 
+let customOpenSshDir = '';
+
+export function setCustomOpenSshDir(dir?: string): void {
+  customOpenSshDir = (dir || '').trim();
+}
+
 /**
- * Resolves the OpenSSH binary path on Windows (prefers C:\Windows\System32\OpenSSH\<name>.exe).
+ * Resolves the OpenSSH binary path on Windows with smart priority:
+ * 1. User-configured custom Win32-OpenSSH directory (e.g. portable v9.8+)
+ * 2. Official Microsoft Win32-OpenSSH MSI install (`C:\Program Files\OpenSSH\<name>.exe`)
+ * 3. Built-in Windows OpenSSH (`C:\Windows\System32\OpenSSH\<name>.exe`)
  */
 export function resolveOpenSshBinary(name: 'ssh' | 'ssh-keygen' | 'ssh-keyscan' | 'scp' | 'sshd'): string {
+  const exeName = IS_WINDOWS ? `${name}.exe` : name;
+
+  if (customOpenSshDir) {
+    const customCandidate = path.join(customOpenSshDir, exeName);
+    if (fs.existsSync(customCandidate)) {
+      return customCandidate;
+    }
+  }
+
   if (!IS_WINDOWS) {
     return name;
   }
-  const sysRoot = process.env.SystemRoot || 'C:\\Windows';
-  const candidate = path.join(sysRoot, 'System32', 'OpenSSH', `${name}.exe`);
-  if (fs.existsSync(candidate)) {
-    return candidate;
+
+  const programFiles = process.env.ProgramFiles || 'C:\\Program Files';
+  const modernWin32Candidate = path.join(programFiles, 'OpenSSH', exeName);
+  if (fs.existsSync(modernWin32Candidate)) {
+    return modernWin32Candidate;
   }
-  return `${name}.exe`;
+
+  const sysRoot = process.env.SystemRoot || 'C:\\Windows';
+  const builtinCandidate = path.join(sysRoot, 'System32', 'OpenSSH', exeName);
+  if (fs.existsSync(builtinCandidate)) {
+    return builtinCandidate;
+  }
+
+  return exeName;
+}
+
+/**
+ * Queries OpenSSH binary version (`ssh -V` / `sshd -V`, which prints to stderr).
+ */
+export async function detectOpenSshVersion(
+  binary: 'ssh' | 'sshd' = 'ssh'
+): Promise<OpenSshVersionInfo> {
+  const binPath = resolveOpenSshBinary(binary);
+  const res = await execCmd(binPath, ['-V'], { timeoutMs: 5000 });
+  const combined = `${res.stderr}\n${res.stdout}`.trim();
+  return parseOpenSshVersion(combined);
 }
 
 /**

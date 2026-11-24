@@ -4,28 +4,34 @@ import type {
   AppSettings,
   DetectedBrowser,
   DiagnosticsResult,
+  EnvironmentInfo,
   NodeProfile,
 } from '../../../shared/types';
 import { IconActivity, IconCopy, IconGlobe, IconTerminal } from '../../components/Icons';
 import { StatusBadge } from '../../components/StatusBadge';
 
 interface ClientToolsProps {
+  envInfo: EnvironmentInfo | null;
   settings: AppSettings;
   activeNode: NodeProfile | null;
   onUpdateSettings: (patch: Partial<AppSettings>) => Promise<void>;
+  onRefreshEnv: () => Promise<void>;
   onNotify: (type: 'success' | 'error' | 'warn' | 'info', msg: string) => void;
 }
 
 export const ClientTools: React.FC<ClientToolsProps> = ({
+  envInfo,
   settings,
   activeNode,
   onUpdateSettings,
+  onRefreshEnv,
   onNotify,
 }) => {
   const [browsers, setBrowsers] = useState<DetectedBrowser[]>([]);
   const [diagTarget, setDiagTarget] = useState('https://chatgpt.com');
   const [diagResult, setDiagResult] = useState<DiagnosticsResult | null>(null);
   const [diagBusy, setDiagBusy] = useState(false);
+  const [engineBusy, setEngineBusy] = useState(false);
 
   useEffect(() => {
     window.relayApi.detectBrowsers().then(setBrowsers);
@@ -55,6 +61,47 @@ export const ClientTools: React.FC<ClientToolsProps> = ({
     onNotify(res.ok ? 'success' : 'error', res.message);
   };
 
+  const handlePickOpenSshDir = async () => {
+    const dir = await window.relayApi.selectDirectory('选择新版 Win32-OpenSSH 目录（含 ssh.exe）');
+    if (dir) {
+      await onUpdateSettings({ customOpenSshDir: dir });
+      await onRefreshEnv();
+      onNotify('success', `已设置自定义 OpenSSH 目录: ${dir}`);
+    }
+  };
+
+  const handleResetOpenSshDir = async () => {
+    await onUpdateSettings({ customOpenSshDir: '' });
+    await onRefreshEnv();
+    onNotify('info', '已恢复自动探测系统 OpenSSH 路径');
+  };
+
+  const handleDownloadHysteria = async () => {
+    setEngineBusy(true);
+    try {
+      const res = await window.relayApi.downloadHysteriaBinary('clientA');
+      onNotify(res.ok ? 'success' : 'error', res.message);
+      await onRefreshEnv();
+    } finally {
+      setEngineBusy(false);
+    }
+  };
+
+  const handleImportHysteria = async () => {
+    const file = await window.relayApi.selectFile('选择本地 Hysteria 2 可执行文件', [
+      { name: 'Hysteria 2', extensions: ['exe'] },
+    ]);
+    if (!file) return;
+    setEngineBusy(true);
+    try {
+      const res = await window.relayApi.importHysteriaBinary('clientA', file);
+      onNotify(res.ok ? 'success' : 'error', res.message);
+      await onRefreshEnv();
+    } finally {
+      setEngineBusy(false);
+    }
+  };
+
   const handleRunDiagnostics = async () => {
     setDiagBusy(true);
     try {
@@ -74,10 +121,105 @@ export const ClientTools: React.FC<ClientToolsProps> = ({
     <div className="stack-md">
       <div className="page-header">
         <div>
-          <h1 className="page-title">代理浏览器、终端辅助与链路诊断</h1>
+          <h1 className="page-title">代理浏览器、内核管理与链路诊断</h1>
           <p className="page-desc">
-            配置环境隔离的全站代理浏览器、复制 API/终端代理变量，以及一键核验出口 IP 与目标站连通性
+            管理 OpenSSH / QUIC (Hysteria 2) 传输内核、独立全站代理浏览器、终端代理变量与链路自检
           </p>
+        </div>
+      </div>
+
+      {/* Transport Engines & Win32-OpenSSH Version Card */}
+      <div className="card stack-sm">
+        <div className="card-header" style={{ marginBottom: 4 }}>
+          <div>
+            <h3 className="card-title">跨国弱网传输内核与 Win32-OpenSSH 版本管理</h3>
+            <p className="card-subtitle">
+              升级新版 Win32-OpenSSH (v9.5+) 可提升 SSH 吞吐；部署 Hysteria 2 (QUIC) 可彻底消除弱网 TCP-over-TCP 熔断并支持 UDP
+            </p>
+          </div>
+        </div>
+
+        <div className="grid-2">
+          <div className="metric-tile stack-sm" style={{ gap: 8 }}>
+            <div className="row-between">
+              <span className="metric-label">OpenSSH 客户端版本</span>
+              <StatusBadge
+                variant={
+                  envInfo?.sshClientVersion.isLegacy
+                    ? 'warn'
+                    : envInfo?.sshClientAvailable
+                    ? 'success'
+                    : 'danger'
+                }
+                label={
+                  envInfo?.sshClientVersion.version
+                    ? `v${envInfo.sshClientVersion.version}${envInfo.sshClientVersion.isLegacy ? ' (较旧)' : ''}`
+                    : envInfo?.sshClientAvailable
+                    ? '可用'
+                    : '未检测到'
+                }
+              />
+            </div>
+            <div className="mono" style={{ fontSize: 11.5, color: 'var(--text-secondary)', wordBreak: 'break-all' }}>
+              {envInfo?.sshClientPath || '自动探测'}
+            </div>
+            {envInfo?.sshClientVersion.isLegacy && (
+              <div style={{ fontSize: 12, color: 'var(--warn)' }}>
+                检测到旧版 Windows 内置 OpenSSH（&lt; 9.0），建议升级官方 Win32-OpenSSH v9.8+ 提升并发吞吐。
+              </div>
+            )}
+            <div className="row-wrap">
+              <button className="btn btn-sm" onClick={handlePickOpenSshDir}>
+                指定新版 OpenSSH 目录
+              </button>
+              {settings.customOpenSshDir && (
+                <button className="btn btn-sm btn-ghost" onClick={handleResetOpenSshDir}>
+                  恢复默认
+                </button>
+              )}
+              <button
+                className="btn btn-sm btn-ghost"
+                onClick={() =>
+                  window.relayApi.openExternal('https://github.com/PowerShell/Win32-OpenSSH/releases')
+                }
+              >
+                下载新版 Win32-OpenSSH
+              </button>
+            </div>
+          </div>
+
+          <div className="metric-tile stack-sm" style={{ gap: 8 }}>
+            <div className="row-between">
+              <span className="metric-label">Hysteria 2 (QUIC 弱网加速引擎)</span>
+              <StatusBadge
+                variant={envInfo?.hysteriaClient.installed ? 'success' : 'neutral'}
+                label={
+                  envInfo?.hysteriaClient.installed
+                    ? `已就绪 (${envInfo.hysteriaClient.version ?? 'v2'})`
+                    : '未安装'
+                }
+              />
+            </div>
+            <div className="mono" style={{ fontSize: 11.5, color: 'var(--text-secondary)', wordBreak: 'break-all' }}>
+              {envInfo?.hysteriaClient.path || '自动托管目录'}
+            </div>
+            <div className="row-wrap">
+              <button
+                className="btn btn-sm btn-primary"
+                onClick={handleDownloadHysteria}
+                disabled={engineBusy}
+              >
+                {engineBusy ? '处理中...' : '一键下载 Hysteria 2'}
+              </button>
+              <button
+                className="btn btn-sm"
+                onClick={handleImportHysteria}
+                disabled={engineBusy}
+              >
+                导入本地 hysteria.exe
+              </button>
+            </div>
+          </div>
         </div>
       </div>
 

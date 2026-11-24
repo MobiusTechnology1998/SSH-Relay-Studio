@@ -4,6 +4,7 @@ import type {
   AppRole,
   AppSettings,
   AuthorizedKeysState,
+  BinaryStatusInfo,
   BrowserPrefs,
   DetectedBrowser,
   DiagnosticsResult,
@@ -12,6 +13,8 @@ import type {
   KeyPairInfo,
   LogEntry,
   NodeProfile,
+  QuicServerConfigInput,
+  QuicServerStatus,
   SecurityCheckResult,
   ServerOverview,
   ServerSystemTuningState,
@@ -30,6 +33,7 @@ export interface RelayApi {
   relaunchAsAdmin: (targetRole?: 'serverB' | 'clientA') => Promise<ActionResult>;
   copyText: (text: string) => Promise<boolean>;
   selectFile: (title: string, filters?: Array<{ name: string; extensions: string[] }>) => Promise<string | null>;
+  selectDirectory: (title: string) => Promise<string | null>;
   openExternal: (url: string) => Promise<void>;
 
   // Logs
@@ -57,10 +61,10 @@ export interface RelayApi {
   ) => Promise<ActionResult>;
   runSecurityVerification: (node: NodeProfile) => Promise<SecurityCheckResult>;
 
-  // Client A: Browser, Diagnostics & AutoStart
+  // Client A: Browser, Diagnostics, Engines & AutoStart
   detectBrowsers: () => Promise<DetectedBrowser[]>;
   launchProxyBrowser: (
-    node: Pick<NodeProfile, 'mode' | 'localPort'>,
+    node: Pick<NodeProfile, 'mode' | 'localPort' | 'engine'>,
     prefs: BrowserPrefs
   ) => Promise<ActionResult>;
   runDiagnostics: (
@@ -68,8 +72,10 @@ export interface RelayApi {
     targetUrl?: string
   ) => Promise<DiagnosticsResult>;
   setAutoStart: (enabled: boolean) => Promise<ActionResult>;
+  downloadHysteriaBinary: (scope: 'clientA' | 'serverB', customUrl?: string) => Promise<ActionResult<BinaryStatusInfo>>;
+  importHysteriaBinary: (scope: 'clientA' | 'serverB', filePath: string) => Promise<ActionResult<BinaryStatusInfo>>;
 
-  // Server B: Overview, Service, Config, Keys, Firewall, Stability
+  // Server B: Overview, Service, Config, Keys, Firewall, Stability & QUIC
   getServerOverview: () => Promise<ServerOverview>;
   installOpenSshServer: () => Promise<ActionResult>;
   controlSshdService: (action: 'start' | 'stop' | 'restart') => Promise<ActionResult>;
@@ -86,6 +92,9 @@ export interface RelayApi {
   disablePort22FirewallRule: () => Promise<ActionResult>;
   setDisableAutoReboot: (disable: boolean) => Promise<ActionResult<WindowsUpdatePolicyState>>;
   applyServerSystemTuning: () => Promise<ActionResult<ServerSystemTuningState>>;
+  deployQuicServer: (cfg: QuicServerConfigInput) => Promise<ActionResult<QuicServerStatus>>;
+  stopQuicServer: () => Promise<ActionResult>;
+  configureQuicStartupTask: () => Promise<ActionResult<QuicServerStatus>>;
 }
 
 const api: RelayApi = {
@@ -96,6 +105,7 @@ const api: RelayApi = {
   relaunchAsAdmin: (targetRole) => ipcRenderer.invoke('app:relaunchAsAdmin', targetRole),
   copyText: (text) => ipcRenderer.invoke('app:copyText', text),
   selectFile: (title, filters) => ipcRenderer.invoke('app:selectFile', title, filters),
+  selectDirectory: (title) => ipcRenderer.invoke('app:selectDirectory', title),
   openExternal: (url) => ipcRenderer.invoke('app:openExternal', url),
 
   getLogs: () => ipcRenderer.invoke('logs:get'),
@@ -129,6 +139,10 @@ const api: RelayApi = {
   launchProxyBrowser: (node, prefs) => ipcRenderer.invoke('clientA:launchProxyBrowser', node, prefs),
   runDiagnostics: (node, targetUrl) => ipcRenderer.invoke('clientA:runDiagnostics', node, targetUrl),
   setAutoStart: (enabled) => ipcRenderer.invoke('clientA:setAutoStart', enabled),
+  downloadHysteriaBinary: (scope, customUrl) =>
+    ipcRenderer.invoke('engine:downloadHysteria', scope, customUrl),
+  importHysteriaBinary: (scope, filePath) =>
+    ipcRenderer.invoke('engine:importHysteria', scope, filePath),
 
   getServerOverview: () => ipcRenderer.invoke('serverB:getOverview'),
   installOpenSshServer: () => ipcRenderer.invoke('serverB:installOpenSsh'),
@@ -145,6 +159,9 @@ const api: RelayApi = {
   disablePort22FirewallRule: () => ipcRenderer.invoke('serverB:disablePort22Firewall'),
   setDisableAutoReboot: (disable) => ipcRenderer.invoke('serverB:setDisableAutoReboot', disable),
   applyServerSystemTuning: () => ipcRenderer.invoke('serverB:applySystemTuning'),
+  deployQuicServer: (cfg) => ipcRenderer.invoke('serverB:deployQuicServer', cfg),
+  stopQuicServer: () => ipcRenderer.invoke('serverB:stopQuicServer'),
+  configureQuicStartupTask: () => ipcRenderer.invoke('serverB:configureQuicStartupTask'),
 };
 
 contextBridge.exposeInMainWorld('relayApi', api);

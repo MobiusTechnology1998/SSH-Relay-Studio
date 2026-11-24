@@ -93,7 +93,7 @@ export function formatSshCommandPreview(node: NodeProfile, resolvedKeyPath?: str
  *   and cannot carry HTTP/3 (QUIC/UDP), preventing 200ms~1s fallback delays on Cloudflare/Google/OpenAI.
  */
 export function buildBrowserLaunchArgs(
-  node: Pick<NodeProfile, 'mode' | 'localPort'>,
+  node: Pick<NodeProfile, 'mode' | 'localPort' | 'engine'>,
   prefs: BrowserPrefs,
   resolvedUserDataDir: string
 ): string[] {
@@ -103,7 +103,8 @@ export function buildBrowserLaunchArgs(
     `--user-data-dir=${resolvedUserDataDir}`,
   ];
 
-  if (node.mode === 'socks5' && prefs.disableQuic !== false) {
+  // OpenSSH -D cannot tunnel UDP/QUIC; Hysteria 2 natively supports UDP ASSOCIATE so keep QUIC enabled there
+  if (node.mode === 'socks5' && node.engine !== 'hysteria2' && prefs.disableQuic !== false) {
     args.push('--disable-quic');
   }
 

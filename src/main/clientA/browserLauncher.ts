@@ -90,7 +90,7 @@ export function resolveDefaultBrowserProfileDir(browserId: BrowserPrefs['selecte
 }
 
 export function launchProxyBrowser(
-  node: Pick<NodeProfile, 'mode' | 'localPort'>,
+  node: Pick<NodeProfile, 'mode' | 'localPort' | 'engine'>,
   prefs: BrowserPrefs
 ): ActionResult {
   const detected = detectInstalledBrowsers();

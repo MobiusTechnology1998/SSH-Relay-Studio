@@ -1,6 +1,6 @@
 import type { ActionResult, OpenSshServiceStatus } from '../../shared/types';
 import { logger } from '../logger';
-import { execCmd, IS_WINDOWS, runPowerShell } from '../platform/shell';
+import { detectOpenSshVersion, execCmd, IS_WINDOWS, runPowerShell } from '../platform/shell';
 
 export async function getOpenSshServiceStatus(): Promise<OpenSshServiceStatus> {
   if (!IS_WINDOWS) {
@@ -12,6 +12,7 @@ export async function getOpenSshServiceStatus(): Promise<OpenSshServiceStatus> {
       startType: 'Unknown',
       failureRecoveryConfigured: false,
       failureRecoveryDetail: '非 Windows 环境（仅在 Windows 目标机上检测）',
+      sshdVersion: await detectOpenSshVersion('ssh'),
     };
   }
 
@@ -28,7 +29,10 @@ export async function getOpenSshServiceStatus(): Promise<OpenSshServiceStatus> {
     $obj | ConvertTo-Json -Compress
   `;
 
-  const res = await runPowerShell(psScript, 20000);
+  const [res, sshdVersion] = await Promise.all([
+    runPowerShell(psScript, 20000),
+    detectOpenSshVersion('sshd'),
+  ]);
   let parsed: {
     serviceExists?: boolean;
     status?: string;
@@ -75,6 +79,7 @@ export async function getOpenSshServiceStatus(): Promise<OpenSshServiceStatus> {
     startType: parsed.startType || 'Unknown',
     failureRecoveryConfigured,
     failureRecoveryDetail,
+    sshdVersion,
   };
 }
 

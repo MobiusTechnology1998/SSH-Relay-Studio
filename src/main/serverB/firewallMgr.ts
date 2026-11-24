@@ -12,6 +12,7 @@ export async function listSshFirewallRules(): Promise<FirewallRuleInfo[]> {
       Where-Object {
         $_.Name -like '*OpenSSH*' -or
         $_.Name -like 'SSH-Port-*' -or
+        $_.Name -like 'Hysteria2-UDP-*' -or
         $_.DisplayName -like '*OpenSSH*'
       }
     $result = @()
@@ -22,7 +23,7 @@ export async function listSshFirewallRules(): Promise<FirewallRuleInfo[]> {
         displayName = $r.DisplayName
         enabled = ($r.Enabled.ToString() -eq 'True')
         action = $r.Action.ToString()
-        localPort = if ($pf -and $pf.LocalPort) { ($pf.LocalPort -join ',') } else { '' }
+        localPort = if ($pf -and $pf.LocalPort) { ($pf.Protocol + ' ' + ($pf.LocalPort -join ',')) } else { '' }
       }
     }
     ConvertTo-Json -InputObject $result -Compress
@@ -76,6 +77,43 @@ export async function allowFirewallPort(port: number): Promise<ActionResult> {
   return {
     ok: true,
     message: `已放行 Windows 防火墙 TCP ${port} 端口（规则名: ${ruleName}）`,
+  };
+}
+
+export async function allowUdpFirewallPort(port: number): Promise<ActionResult> {
+  if (!IS_WINDOWS) {
+    return { ok: false, message: '仅支持在 Windows 设备 B 上配置系统防火墙' };
+  }
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    return { ok: false, message: `无效 UDP 端口号: ${port}` };
+  }
+
+  const ruleName = `Hysteria2-UDP-${port}`;
+  const displayName = `SSH Relay Studio QUIC (UDP ${port})`;
+
+  const psScript = `
+    $ErrorActionPreference = 'Stop'
+    $existing = Get-NetFirewallRule -Name '${ruleName}' -ErrorAction SilentlyContinue
+    if ($null -ne $existing) {
+      Enable-NetFirewallRule -Name '${ruleName}'
+      Set-NetFirewallRule -Name '${ruleName}' -Action Allow -Direction Inbound
+    } else {
+      New-NetFirewallRule -Name '${ruleName}' -DisplayName '${displayName}' -Enabled True -Direction Inbound -Protocol UDP -Action Allow -LocalPort ${port} | Out-Null
+    }
+    Write-Output 'OK'
+  `;
+
+  const res = await runPowerShell(psScript, 15000);
+  if (res.code !== 0) {
+    const msg = `放行防火墙 UDP 端口 ${port} 失败: ${res.stderr.trim() || res.stdout.trim()}`;
+    logger.error('serverB', msg);
+    return { ok: false, message: msg };
+  }
+
+  logger.success('serverB', `已放行 Windows 防火墙入站规则 ${ruleName} (UDP ${port})`);
+  return {
+    ok: true,
+    message: `已放行 Windows 防火墙 UDP ${port} 端口（规则名: ${ruleName}）`,
   };
 }
 

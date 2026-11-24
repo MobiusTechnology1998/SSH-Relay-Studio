@@ -42,6 +42,18 @@ export const ServerDashboard: React.FC<ServerDashboardProps> = ({
 
   const handleGenerateToken = () => {
     try {
+      const qs = overview?.quicServer;
+      const quic =
+        qs && qs.configured && qs.authToken && qs.certPinSha256
+          ? {
+              udpPort: qs.udpPort,
+              authToken: qs.authToken,
+              certPinSha256: qs.certPinSha256,
+              sni: qs.sni,
+              obfsPassword: qs.obfsPassword || undefined,
+            }
+          : undefined;
+
       const token = encodePairingToken({
         version: 1,
         name: exportName,
@@ -49,6 +61,7 @@ export const ServerDashboard: React.FC<ServerDashboardProps> = ({
         sshPort: overview?.config.port ?? 53622,
         username: exportUser,
         hostPublicKey: overview?.hostPublicKey ?? undefined,
+        quic,
         createdAt: Date.now(),
       });
       setGeneratedToken(token);
@@ -87,7 +100,7 @@ export const ServerDashboard: React.FC<ServerDashboardProps> = ({
         <div>
           <h1 className="page-title">设备 B 中转端总览</h1>
           <p className="page-desc">
-            实时监控 OpenSSH 服务、监听端口、安全加固状态与来源 IP，支持一键导出配对码给设备 A
+            实时监控 OpenSSH 与 QUIC (Hysteria 2) 服务、监听端口、安全加固状态与来源 IP，支持一键导出配对码给设备 A
           </p>
         </div>
         <div className="header-actions">
@@ -118,11 +131,17 @@ export const ServerDashboard: React.FC<ServerDashboardProps> = ({
             />
           </div>
           <div className="metric-value" style={{ marginTop: 8 }}>
-            sshd
+            sshd{' '}
+            {overview?.service.sshdVersion?.version
+              ? `v${overview.service.sshdVersion.version}`
+              : ''}
           </div>
           <div className="metric-sub">
-            启动类型：{overview?.service.startType ?? '--'} · 自愈：
-            {overview?.service.failureRecoveryConfigured ? '已开启' : '未配置'}
+            {overview?.service.sshdVersion?.isLegacy
+              ? '版本较旧(<9.0)，建议升级 Win32-OpenSSH'
+              : `启动：${overview?.service.startType ?? '--'} · 自愈：${
+                  overview?.service.failureRecoveryConfigured ? '已开启' : '未配置'
+                }`}
           </div>
         </div>
 
@@ -367,9 +386,21 @@ export const ServerDashboard: React.FC<ServerDashboardProps> = ({
             />
           </div>
         </div>
-        <div className="callout">
-          SSH 端口：<strong className="mono">{overview?.config.port ?? 53622}</strong> · 主机公钥：
-          <strong>{overview?.hostPublicKey ? '已自动附带（A 端免手输 yes）' : '未读取到'}</strong>
+        <div className="callout stack-sm" style={{ gap: 4 }}>
+          <div>
+            SSH 端口：<strong className="mono">{overview?.config.port ?? 53622}</strong> · 主机公钥：
+            <strong>{overview?.hostPublicKey ? '已自动附带（A 端免手输 yes）' : '未读取到'}</strong>
+          </div>
+          <div>
+            QUIC (Hysteria 2)：
+            {overview?.quicServer.configured ? (
+              <strong>
+                已自动附带（UDP {overview.quicServer.udpPort} · 鉴权密钥 + TLS SHA-256 指纹）
+              </strong>
+            ) : (
+              <span>未部署（仅导出 OpenSSH 配对；可在「安全加固与稳定性」一键开启 QUIC 跨国弱网加速）</span>
+            )}
+          </div>
         </div>
 
         {generatedToken && (

@@ -31,6 +31,12 @@ function createEmptyNode(): NodeProfile {
     healthCheckIntervalSec: 25,
     poolSize: 3,
     rotationIntervalMin: 0,
+    engine: 'openssh',
+    autoFallbackToSsh: true,
+    quicUdpPort: 53623,
+    quicSni: 'www.bing.com',
+    quicUpMbps: 50,
+    quicDownMbps: 200,
     notes: '',
   };
 }
@@ -83,6 +89,7 @@ export const ClientNodes: React.FC<ClientNodesProps> = ({
   const handleImportPairing = async () => {
     try {
       const payload = decodePairingToken(pairingInput);
+      const hasQuic = Boolean(payload.quic);
       const newNode: NodeProfile = {
         id: `node-${Date.now()}`,
         name: payload.name,
@@ -94,6 +101,20 @@ export const ClientNodes: React.FC<ClientNodesProps> = ({
         remoteProxyPort: 7890,
         privateKeyPath: '',
         expectedHostKey: payload.hostPublicKey,
+        poolSize: 3,
+        forceIpv4: true,
+        preferFastCipher: true,
+        healthCheckEnabled: true,
+        healthCheckIntervalSec: 25,
+        engine: hasQuic ? 'hysteria2' : 'openssh',
+        autoFallbackToSsh: true,
+        quicUdpPort: payload.quic?.udpPort ?? 53623,
+        quicAuthToken: payload.quic?.authToken,
+        quicCertPinSha256: payload.quic?.certPinSha256,
+        quicSni: payload.quic?.sni ?? 'www.bing.com',
+        quicObfsPassword: payload.quic?.obfsPassword,
+        quicUpMbps: 50,
+        quicDownMbps: 200,
       };
 
       // If pairing code embeds Device B's host public key, trust it automatically into known_hosts!
@@ -115,7 +136,9 @@ export const ClientNodes: React.FC<ClientNodesProps> = ({
       setPairingInput('');
       onNotify(
         'success',
-        payload.hostPublicKey
+        hasQuic
+          ? `已导入节点「${newNode.name}」，自动启用 QUIC (Hysteria 2) 跨国加速（并已信任 SSH 指纹用于自动容灾回退）！`
+          : payload.hostPublicKey
           ? `已导入节点「${newNode.name}」并自动写入主机指纹信任！`
           : `已导入节点「${newNode.name}」`
       );
@@ -138,7 +161,7 @@ export const ClientNodes: React.FC<ClientNodesProps> = ({
         <div>
           <h1 className="page-title">中转节点管理</h1>
           <p className="page-desc">
-            管理一个或多个设备 B 中转端配置，支持标准 SOCKS5 动态隧道与 B 端上游代理转发模式
+            管理一个或多个设备 B 中转端配置，支持 OpenSSH 多隧道连接池与 QUIC (Hysteria 2) 跨国弱网加速引擎
           </p>
         </div>
         <div className="header-actions">
@@ -177,17 +200,21 @@ export const ClientNodes: React.FC<ClientNodesProps> = ({
                     <strong style={{ fontSize: 15 }}>{node.name}</strong>
                     {isSelected && <StatusBadge variant="accent" label="当前使用" />}
                     <StatusBadge
-                      variant="neutral"
+                      variant={node.engine === 'hysteria2' ? 'success' : 'neutral'}
                       dot={false}
                       label={
-                        node.mode === 'socks5'
-                          ? `SOCKS5 :${node.localPort} · ${node.poolSize ?? 3} 通道`
-                          : `端口转发 :${node.localPort} → B:${node.remoteProxyPort} · ${node.poolSize ?? 3} 通道`
+                        node.engine === 'hysteria2'
+                          ? `QUIC 加速 :${node.localPort}`
+                          : node.mode === 'socks5'
+                          ? `SSH SOCKS5 :${node.localPort} · ${node.poolSize ?? 3} 通道`
+                          : `SSH 转发 :${node.localPort} → B:${node.remoteProxyPort} · ${node.poolSize ?? 3} 通道`
                       }
                     />
                   </div>
                   <div className="mono" style={{ fontSize: 12.5, color: 'var(--text-secondary)' }}>
-                    {node.username}@{node.host}:{node.sshPort}
+                    {node.engine === 'hysteria2'
+                      ? `QUIC UDP ${node.host}:${node.quicUdpPort ?? 53623} (备用 SSH :${node.sshPort})`
+                      : `${node.username}@${node.host}:${node.sshPort}`}
                   </div>
                 </div>
                 <div className="row-wrap">
@@ -278,6 +305,137 @@ export const ClientNodes: React.FC<ClientNodesProps> = ({
                 />
               </div>
             </div>
+
+            <div className="field">
+              <label className="field-label">传输引擎（跨国弱网核心优化）</label>
+              <select
+                className="select"
+                value={editing.engine ?? 'openssh'}
+                onChange={(e) =>
+                  setEditing({
+                    ...editing,
+                    engine: e.target.value as NodeProfile['engine'],
+                  })
+                }
+              >
+                <option value="openssh">
+                  OpenSSH 多隧道并行连接池（设备 B 零额外软件，兼容性最强）
+                </option>
+                <option value="hysteria2">
+                  QUIC / Hysteria 2 跨国弱网引擎（UDP 抗丢包 + Brutal 拥塞控制 + 原生 UDP，推荐高丢包跨国链路）
+                </option>
+              </select>
+            </div>
+
+            {editing.engine === 'hysteria2' && (
+              <div className="callout callout-accent stack-sm" style={{ padding: 12 }}>
+                <div style={{ fontWeight: 650, fontSize: 13 }}>
+                  QUIC (Hysteria 2) 跨国弱网加速参数（导入设备 B 配对码会自动填充）
+                </div>
+                <div className="grid-2">
+                  <div className="field">
+                    <label className="field-label">设备 B QUIC UDP 端口</label>
+                    <input
+                      className="input mono"
+                      type="number"
+                      value={editing.quicUdpPort ?? 53623}
+                      onChange={(e) =>
+                        setEditing({
+                          ...editing,
+                          quicUdpPort: Number(e.target.value) || 53623,
+                        })
+                      }
+                    />
+                  </div>
+                  <div className="field">
+                    <label className="field-label">TLS 伪装域名 (SNI)</label>
+                    <input
+                      className="input mono"
+                      value={editing.quicSni ?? 'www.bing.com'}
+                      onChange={(e) => setEditing({ ...editing, quicSni: e.target.value })}
+                      placeholder="www.bing.com"
+                    />
+                  </div>
+                </div>
+                <div className="grid-2">
+                  <div className="field">
+                    <label className="field-label">QUIC 鉴权密钥 (Auth Token)</label>
+                    <input
+                      className="input mono"
+                      value={editing.quicAuthToken ?? ''}
+                      onChange={(e) => setEditing({ ...editing, quicAuthToken: e.target.value })}
+                      placeholder="从设备 B 配对码自动导入"
+                    />
+                  </div>
+                  <div className="field">
+                    <label className="field-label">Salamander 混淆密码（可选，防 UDP QoS）</label>
+                    <input
+                      className="input mono"
+                      value={editing.quicObfsPassword ?? ''}
+                      onChange={(e) =>
+                        setEditing({ ...editing, quicObfsPassword: e.target.value })
+                      }
+                      placeholder="留空则不启用混淆"
+                    />
+                  </div>
+                </div>
+                <div className="field">
+                  <label className="field-label">服务端证书指纹 pinSHA256（防中间人攻击）</label>
+                  <input
+                    className="input mono"
+                    value={editing.quicCertPinSha256 ?? ''}
+                    onChange={(e) =>
+                      setEditing({ ...editing, quicCertPinSha256: e.target.value })
+                    }
+                    placeholder="AA:BB:CC:..."
+                  />
+                </div>
+                <div className="grid-2">
+                  <div className="field">
+                    <label className="field-label">本机上行带宽期望 (Mbps，Brutal)</label>
+                    <input
+                      className="input mono"
+                      type="number"
+                      min={5}
+                      max={2000}
+                      value={editing.quicUpMbps ?? 50}
+                      onChange={(e) =>
+                        setEditing({
+                          ...editing,
+                          quicUpMbps: Math.max(5, Number(e.target.value) || 50),
+                        })
+                      }
+                    />
+                  </div>
+                  <div className="field">
+                    <label className="field-label">本机下行带宽期望 (Mbps，Brutal)</label>
+                    <input
+                      className="input mono"
+                      type="number"
+                      min={10}
+                      max={5000}
+                      value={editing.quicDownMbps ?? 200}
+                      onChange={(e) =>
+                        setEditing({
+                          ...editing,
+                          quicDownMbps: Math.max(10, Number(e.target.value) || 200),
+                        })
+                      }
+                    />
+                  </div>
+                </div>
+                <label className="checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={editing.autoFallbackToSsh !== false}
+                    onChange={(e) =>
+                      setEditing({ ...editing, autoFallbackToSsh: e.target.checked })
+                    }
+                  />
+                  <span>UDP 被屏蔽/握手失败时，自动无缝回退至 OpenSSH 多隧道连接池（强烈推荐）</span>
+                </label>
+              </div>
+            )}
 
             <div className="field">
               <label className="field-label">隧道转发模式</label>

@@ -25,6 +25,7 @@ import {
 } from '../platform/shell';
 import { probeTunnelHealth } from './healthProbe';
 import { findFreeLocalPort, LocalProxyBalancer } from './localProxyBalancer';
+import { QuicTunnelEngine } from './quicEngine';
 
 type StatusListener = (status: TunnelStatus) => void;
 
@@ -57,12 +58,15 @@ interface PoolWorker {
 
 class TunnelManager {
   private balancer: LocalProxyBalancer;
+  private quicEngine: QuicTunnelEngine;
+  private customHysteriaPath = '';
   private workers = new Map<string, PoolWorker>();
   private staggerTimers: NodeJS.Timeout[] = [];
   private metricsTimer: NodeJS.Timeout | null = null;
   private rotationTimer: NodeJS.Timeout | null = null;
   private resumeProbeTimer: NodeJS.Timeout | null = null;
   private desiredRunning = false;
+  private runningQuicMode = false;
   private activeNode: NodeProfile | null = null;
   private sessionEpoch = 0;
   private workerSeq = 0;
@@ -75,6 +79,8 @@ class TunnelManager {
     nodeId: null,
     nodeName: null,
     mode: 'socks5',
+    activeEngine: 'openssh',
+    fallbackActive: false,
     localPort: 1080,
     pid: null,
     connectedSince: null,
@@ -104,6 +110,27 @@ class TunnelManager {
         void this.probeWorkerNow(w, this.sessionEpoch);
       },
     });
+
+    this.quicEngine = new QuicTunnelEngine({
+      onStatusUpdate: (patch) => {
+        if (!this.runningQuicMode) return;
+        this.emit(patch);
+      },
+      onFallbackToSsh: (reason) => {
+        const node = this.activeNode;
+        if (!node || !this.runningQuicMode) return;
+        logger.warn(
+          'tunnel',
+          `QUIC 引擎不可用（${reason}），正在自动无缝切换至 OpenSSH 多隧道连接池...`
+        );
+        this.runningQuicMode = false;
+        void this.startOpenSshPool(node, true);
+      },
+    });
+  }
+
+  public setCustomHysteriaPath(binPath?: string): void {
+    this.customHysteriaPath = (binPath || '').trim();
   }
 
   public getStatus(): TunnelStatus {
@@ -279,8 +306,8 @@ class TunnelManager {
       return { ok: false, message: '节点主机地址不能为空' };
     }
 
-    // Stop any previous pool cleanly
-    if (this.desiredRunning || this.workers.size > 0) {
+    // Stop any previous pool or QUIC engine cleanly
+    if (this.desiredRunning || this.runningQuicMode || this.workers.size > 0) {
       await this.stop(true);
     }
 
@@ -294,6 +321,8 @@ class TunnelManager {
         nodeId: node.id,
         nodeName: node.name,
         mode: node.mode,
+        activeEngine: node.engine === 'hysteria2' ? 'hysteria2' : 'openssh',
+        fallbackActive: false,
         localPort: node.localPort,
         pid: null,
         connectedSince: null,
@@ -312,6 +341,35 @@ class TunnelManager {
       return { ok: false, message: msg, data: this.getStatus() };
     }
 
+    this.activeNode = { ...node };
+
+    if (node.engine === 'hysteria2') {
+      this.runningQuicMode = true;
+      this.desiredRunning = true;
+      const res = await this.quicEngine.start(node, this.customHysteriaPath);
+      if (!res.ok) {
+        this.runningQuicMode = false;
+        this.desiredRunning = false;
+        this.emit({
+          state: 'error',
+          activeEngine: 'hysteria2',
+          fallbackActive: false,
+          lastError: res.message,
+          diagnosticHint: '可在「代理浏览器与工具」下载或导入 hysteria.exe，或将节点引擎切回 OpenSSH 多隧道。',
+        });
+      }
+      return { ok: res.ok, message: res.message, data: this.getStatus() };
+    }
+
+    return this.startOpenSshPool(node, false);
+  }
+
+  private async startOpenSshPool(
+    node: NodeProfile,
+    isFallback: boolean
+  ): Promise<ActionResult<TunnelStatus>> {
+    this.runningQuicMode = false;
+
     try {
       await this.balancer.start(node.localPort);
     } catch (err) {
@@ -322,6 +380,8 @@ class TunnelManager {
         nodeId: node.id,
         nodeName: node.name,
         mode: node.mode,
+        activeEngine: 'openssh',
+        fallbackActive: isFallback,
         localPort: node.localPort,
         lastError: msg,
         diagnosticHint: '请确认本地端口未被占用，或更换本地代理端口（如 1081）。',
@@ -341,6 +401,8 @@ class TunnelManager {
       nodeId: node.id,
       nodeName: node.name,
       mode: node.mode,
+      activeEngine: 'openssh',
+      fallbackActive: isFallback,
       localPort: node.localPort,
       pid: null,
       connectedSince: null,
@@ -360,7 +422,7 @@ class TunnelManager {
 
     logger.info(
       'tunnel',
-      `启动多隧道连接池 (${poolSize} 条并行通道) -> 本地入口 127.0.0.1:${node.localPort} (${node.mode === 'socks5' ? 'SOCKS5' : 'HTTP/本地转发'})`
+      `${isFallback ? '[QUIC 回退] ' : ''}启动多隧道连接池 (${poolSize} 条并行通道) -> 本地入口 127.0.0.1:${node.localPort} (${node.mode === 'socks5' ? 'SOCKS5' : 'HTTP/本地转发'})`
     );
 
     // Stagger worker startup to avoid hitting Device B MaxStartups burst limits
@@ -869,6 +931,10 @@ class TunnelManager {
     if (!this.desiredRunning || !this.activeNode) {
       return { ok: false, message: '当前隧道未运行，无法执行平滑轮换' };
     }
+    if (this.runningQuicMode) {
+      logger.info('tunnel', 'QUIC 模式不支持多槽位轮换，改为快速重建 QUIC 会话...');
+      return this.reconnectNow();
+    }
     const epoch = this.sessionEpoch;
     const poolSize = this.resolvePoolSize(this.activeNode);
     logger.info('tunnel', `开始全池平滑热轮换 (${poolSize} 条通道，先建后拆，业务不断流)...`);
@@ -892,6 +958,7 @@ class TunnelManager {
   private async abortPoolWithFatalError(reason: string, hint: string | null): Promise<void> {
     this.sessionEpoch += 1;
     this.desiredRunning = false;
+    this.runningQuicMode = false;
     this.clearGlobalTimers();
 
     const toKill: Promise<void>[] = [];
@@ -927,6 +994,11 @@ class TunnelManager {
    */
   public handleSystemResume(): void {
     if (!this.desiredRunning || !this.activeNode) return;
+    if (this.runningQuicMode) {
+      this.quicEngine.handleSystemResume();
+      return;
+    }
+
     const epoch = this.sessionEpoch;
     logger.info('tunnel', '检测到系统休眠唤醒，正在快速校验所有连接池通道...');
 
@@ -966,7 +1038,10 @@ class TunnelManager {
   public async stop(silent = false): Promise<ActionResult<TunnelStatus>> {
     this.sessionEpoch += 1;
     this.desiredRunning = false;
+    this.runningQuicMode = false;
     this.clearGlobalTimers();
+
+    await this.quicEngine.stop();
 
     const toKill: Promise<void>[] = [];
     for (const w of this.workers.values()) {
@@ -982,11 +1057,12 @@ class TunnelManager {
     await this.balancer.stop();
 
     if (!silent) {
-      logger.info('tunnel', '已手动断开多隧道连接池并停止所有后台守护进程。');
+      logger.info('tunnel', '已手动断开隧道连接并停止所有后台守护进程。');
     }
 
     this.emit({
       state: 'disconnected',
+      fallbackActive: false,
       pid: null,
       connectedSince: null,
       reconnectCount: 0,
@@ -1010,27 +1086,28 @@ class TunnelManager {
       return { ok: false, message: '当前没有可重连的活动节点' };
     }
     const target = this.activeNode;
-    logger.info('tunnel', '收到手动「立即重连」指令，正在重建多隧道连接池...');
+    logger.info('tunnel', '收到手动「立即重连」指令，正在重建隧道...');
     await this.stop(true);
     return this.start(target);
   }
 
   /**
-   * Cleans up any orphaned ssh.exe processes (useful if user previously ran start_tunnel.vbs).
+   * Cleans up any orphaned ssh.exe / hysteria.exe processes.
    */
   public async killOrphanSshProcesses(): Promise<ActionResult> {
     await this.stop(true);
     if (!IS_WINDOWS) {
       return { ok: true, message: '已停止当前应用托管的所有隧道进程。' };
     }
-    const res = await execCmd('taskkill', ['/F', '/IM', 'ssh.exe'], { timeoutMs: 5000 });
-    if (res.code === 0) {
-      logger.success('tunnel', '已强制清理本机残留的 ssh.exe 进程。');
-      return { ok: true, message: '已清理所有残留的 ssh.exe 进程' };
+    const r1 = await execCmd('taskkill', ['/F', '/IM', 'ssh.exe'], { timeoutMs: 5000 });
+    const r2 = await execCmd('taskkill', ['/F', '/IM', 'hysteria.exe'], { timeoutMs: 5000 });
+    if (r1.code === 0 || r2.code === 0) {
+      logger.success('tunnel', '已强制清理本机残留的 ssh.exe / hysteria.exe 进程。');
+      return { ok: true, message: '已清理所有残留的隧道进程' };
     }
     return {
       ok: true,
-      message: '未发现残留的 ssh.exe 进程（或已全部结束）',
+      message: '未发现残留的 ssh.exe / hysteria.exe 进程（或已全部结束）',
     };
   }
 }

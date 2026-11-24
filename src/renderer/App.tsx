@@ -40,6 +40,8 @@ const DEFAULT_TUNNEL_STATUS: TunnelStatus = {
   nodeId: null,
   nodeName: null,
   mode: 'socks5',
+  activeEngine: 'openssh',
+  fallbackActive: false,
   localPort: 1080,
   pid: null,
   connectedSince: null,
@@ -78,6 +80,11 @@ export const App: React.FC = () => {
     },
     []
   );
+
+  const refreshEnvInfo = useCallback(async () => {
+    const env = await window.relayApi.getEnvInfo();
+    setEnvInfo(env);
+  }, []);
 
   const refreshServerOverview = useCallback(async () => {
     setServerLoading(true);
@@ -329,9 +336,11 @@ export const App: React.FC = () => {
               )}
               {activeTab === 'tools' && (
                 <ClientTools
+                  envInfo={envInfo}
                   settings={settings}
                   activeNode={activeNode}
                   onUpdateSettings={handleUpdateSettings}
+                  onRefreshEnv={refreshEnvInfo}
                   onNotify={notify}
                 />
               )}

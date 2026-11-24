@@ -43,6 +43,13 @@ export const ServerHardening: React.FC<ServerHardeningProps> = ({
       : '30:50:100'
   );
   const [customFwPort, setCustomFwPort] = useState(53622);
+  const [quicUdpPort, setQuicUdpPort] = useState(overview?.quicServer.udpPort ?? 53623);
+  const [quicSni, setQuicSni] = useState(overview?.quicServer.sni ?? 'www.bing.com');
+  const [quicMaxUpMbps, setQuicMaxUpMbps] = useState(overview?.quicServer.maxUpMbps ?? 200);
+  const [quicMaxDownMbps, setQuicMaxDownMbps] = useState(overview?.quicServer.maxDownMbps ?? 200);
+  const [quicEnableObfs, setQuicEnableObfs] = useState(
+    overview?.quicServer.configured ? Boolean(overview.quicServer.obfsPassword) : true
+  );
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
@@ -64,6 +71,13 @@ export const ServerHardening: React.FC<ServerHardeningProps> = ({
         : '30:50:100'
     );
     setCustomFwPort(overview.config.port === 22 ? 53622 : overview.config.port);
+    setQuicUdpPort(overview.quicServer.udpPort || 53623);
+    setQuicSni(overview.quicServer.sni || 'www.bing.com');
+    setQuicMaxUpMbps(overview.quicServer.maxUpMbps || 200);
+    setQuicMaxDownMbps(overview.quicServer.maxDownMbps || 200);
+    if (overview.quicServer.configured) {
+      setQuicEnableObfs(Boolean(overview.quicServer.obfsPassword));
+    }
   }, [
     overview?.config.port,
     overview?.config.pubkeyAuthentication,
@@ -75,6 +89,12 @@ export const ServerHardening: React.FC<ServerHardeningProps> = ({
     overview?.config.compression,
     overview?.config.maxSessions,
     overview?.config.maxStartups,
+    overview?.quicServer.udpPort,
+    overview?.quicServer.sni,
+    overview?.quicServer.maxUpMbps,
+    overview?.quicServer.maxDownMbps,
+    overview?.quicServer.configured,
+    overview?.quicServer.obfsPassword,
   ]);
 
   const handleSaveSshdConfig = async (andRestart: boolean) => {
@@ -171,6 +191,71 @@ export const ServerHardening: React.FC<ServerHardeningProps> = ({
     setBusy(true);
     try {
       const res = await window.relayApi.applyServerSystemTuning();
+      onNotify(res.ok ? 'success' : 'error', res.message);
+      await onRefresh();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleDownloadQuicServer = async () => {
+    setBusy(true);
+    try {
+      const res = await window.relayApi.downloadHysteriaBinary('serverB');
+      onNotify(res.ok ? 'success' : 'error', res.message);
+      await onRefresh();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleImportQuicServer = async () => {
+    const file = await window.relayApi.selectFile('选择本地 Hysteria 2 可执行文件', [
+      { name: 'Hysteria 2', extensions: ['exe'] },
+    ]);
+    if (!file) return;
+    setBusy(true);
+    try {
+      const res = await window.relayApi.importHysteriaBinary('serverB', file);
+      onNotify(res.ok ? 'success' : 'error', res.message);
+      await onRefresh();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleDeployQuicServer = async () => {
+    setBusy(true);
+    try {
+      const res = await window.relayApi.deployQuicServer({
+        udpPort: quicUdpPort,
+        sni: quicSni,
+        maxUpMbps: quicMaxUpMbps,
+        maxDownMbps: quicMaxDownMbps,
+        enableObfs: quicEnableObfs,
+      });
+      onNotify(res.ok ? 'success' : 'error', res.message);
+      await onRefresh();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleStopQuicServer = async () => {
+    setBusy(true);
+    try {
+      const res = await window.relayApi.stopQuicServer();
+      onNotify(res.ok ? 'info' : 'error', res.message);
+      await onRefresh();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleConfigureQuicTask = async () => {
+    setBusy(true);
+    try {
+      const res = await window.relayApi.configureQuicStartupTask();
       onNotify(res.ok ? 'success' : 'error', res.message);
       await onRefresh();
     } finally {
@@ -520,6 +605,149 @@ export const ServerHardening: React.FC<ServerHardeningProps> = ({
           <button className="btn btn-primary" onClick={handleApplySystemTuning} disabled={busy}>
             一键应用跨国弱网 TCP 与防休眠调优
           </button>
+        </div>
+      </div>
+
+      {/* Step 3: High-Performance QUIC (Hysteria 2) Server Engine for Cross-Border Weak Networks */}
+      <div className="card stack-sm">
+        <div className="row-between">
+          <div>
+            <h3 className="card-title">跨国弱网终极引擎：QUIC (Hysteria 2) 服务端</h3>
+            <p className="card-subtitle">
+              基于 UDP QUIC + Brutal 拥塞控制 + Salamander 混淆，彻底消除 SSH TCP-over-TCP 队头阻塞，高丢包跨国链路提速数倍；部署后重新导出配对码即可在 A 端一键启用（支持 UDP 受阻自动回退 OpenSSH）
+            </p>
+          </div>
+          <StatusBadge
+            variant={
+              overview?.quicServer.running
+                ? 'success'
+                : overview?.quicServer.binaryInstalled
+                ? 'warn'
+                : 'neutral'
+            }
+            label={
+              overview?.quicServer.running
+                ? `运行中 (UDP :${overview.quicServer.udpPort})`
+                : overview?.quicServer.binaryInstalled
+                ? '已安装未启动'
+                : '未安装'
+            }
+          />
+        </div>
+
+        <div className="row-wrap">
+          <button
+            className="btn btn-sm"
+            onClick={handleDownloadQuicServer}
+            disabled={busy}
+          >
+            一键下载 Hysteria 2
+          </button>
+          <button
+            className="btn btn-sm"
+            onClick={handleImportQuicServer}
+            disabled={busy}
+          >
+            导入本地 hysteria.exe
+          </button>
+          <span className="mono" style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+            {overview?.quicServer.binaryInstalled
+              ? `${overview.quicServer.binaryVersion ?? 'v2'} · ${overview.quicServer.binaryPath}`
+              : '尚未安装 hysteria.exe（单文件约 15MB）'}
+          </span>
+        </div>
+
+        <div className="grid-4">
+          <div className="field">
+            <label className="field-label">QUIC 监听 UDP 端口</label>
+            <input
+              className="input mono"
+              type="number"
+              value={quicUdpPort}
+              onChange={(e) => setQuicUdpPort(Number(e.target.value) || 53623)}
+            />
+          </div>
+          <div className="field">
+            <label className="field-label">自签名 TLS 伪装 SNI</label>
+            <input
+              className="input mono"
+              value={quicSni}
+              onChange={(e) => setQuicSni(e.target.value)}
+              placeholder="www.bing.com"
+            />
+          </div>
+          <div className="field">
+            <label className="field-label">服务端上行上限 (Mbps)</label>
+            <input
+              className="input mono"
+              type="number"
+              min={10}
+              max={10000}
+              value={quicMaxUpMbps}
+              onChange={(e) => setQuicMaxUpMbps(Math.max(10, Number(e.target.value) || 200))}
+            />
+          </div>
+          <div className="field">
+            <label className="field-label">服务端下行上限 (Mbps)</label>
+            <input
+              className="input mono"
+              type="number"
+              min={10}
+              max={10000}
+              value={quicMaxDownMbps}
+              onChange={(e) => setQuicMaxDownMbps(Math.max(10, Number(e.target.value) || 200))}
+            />
+          </div>
+        </div>
+
+        <label className="checkbox-row">
+          <input
+            type="checkbox"
+            checked={quicEnableObfs}
+            onChange={(e) => setQuicEnableObfs(e.target.checked)}
+          />
+          <span>启用 Salamander UDP 流量混淆（推荐：有效缓解跨国运营商对 QUIC/UDP 的 QoS 限速）</span>
+        </label>
+
+        {overview?.quicServer.configured && (
+          <div className="callout" style={{ fontSize: 12 }}>
+            <div>
+              TLS 证书指纹 <code className="mono">{overview.quicServer.certPinSha256}</code>
+            </div>
+            <div>
+              开机自启计划任务：
+              <strong>{overview.quicServer.startupTaskConfigured ? '已配置（重启自动拉起）' : '未配置'}</strong>
+              {' · '}请在云控制台安全组入方向放行 <strong className="mono">UDP {overview.quicServer.udpPort}</strong>
+            </div>
+          </div>
+        )}
+
+        {overview?.quicServer.lastError && (
+          <div className="callout callout-danger" style={{ fontSize: 12.5 }}>
+            最近错误：{overview.quicServer.lastError}
+          </div>
+        )}
+
+        <div className="row-wrap">
+          <button
+            className="btn btn-primary"
+            onClick={handleDeployQuicServer}
+            disabled={busy || !overview?.quicServer.binaryInstalled}
+          >
+            {overview?.quicServer.running
+              ? '重新生成配置并重启 QUIC'
+              : '一键生成证书、放行 UDP 并启动 QUIC'}
+          </button>
+          {overview?.quicServer.running && (
+            <button className="btn btn-danger" onClick={handleStopQuicServer} disabled={busy}>
+              停止 QUIC 服务
+            </button>
+          )}
+          {overview?.quicServer.configured && (
+            <button className="btn" onClick={handleConfigureQuicTask} disabled={busy}>
+              配置开机自启与崩溃自愈
+            </button>
+          )}
         </div>
       </div>
     </div>

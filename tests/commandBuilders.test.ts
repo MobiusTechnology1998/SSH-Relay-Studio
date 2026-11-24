@@ -97,7 +97,7 @@ describe('commandBuilders', () => {
     expect(args.some((a) => a.includes('--host-resolver-rules'))).toBe(false);
   });
 
-  it('omits --disable-quic when explicitly disabled or in localForward mode', () => {
+  it('omits --disable-quic when explicitly disabled, in localForward mode, or in hysteria2 QUIC mode', () => {
     const optOut = buildBrowserLaunchArgs(
       BASE_NODE,
       { ...BASE_BROWSER, disableQuic: false },
@@ -111,6 +111,13 @@ describe('commandBuilders', () => {
       'C:\\Edge'
     );
     expect(localFwd).not.toContain('--disable-quic');
+
+    const quicEngine = buildBrowserLaunchArgs(
+      { mode: 'socks5', localPort: 1080, engine: 'hysteria2' },
+      BASE_BROWSER,
+      'C:\\Edge'
+    );
+    expect(quicEngine).not.toContain('--disable-quic');
   });
 
   it('includes --host-resolver-rules only when explicitly opted in', () => {

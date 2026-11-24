@@ -20,6 +20,7 @@ import type {
   BrowserPrefs,
   EnvironmentInfo,
   NodeProfile,
+  QuicServerConfigInput,
   ServerOverview,
   TunnelStatus,
 } from '../shared/types';
@@ -35,8 +36,18 @@ import {
 } from './clientA/keyManager';
 import { tunnelManager } from './clientA/tunnelManager';
 import { logger } from './logger';
+import {
+  downloadHysteriaBinary,
+  importLocalHysteriaBinary,
+  inspectHysteriaBinary,
+} from './platform/binaryMgr';
 import { checkIsAdmin, relaunchAsAdmin } from './platform/privilege';
-import { IS_WINDOWS, resolveOpenSshBinary } from './platform/shell';
+import {
+  detectOpenSshVersion,
+  IS_WINDOWS,
+  resolveOpenSshBinary,
+  setCustomOpenSshDir,
+} from './platform/shell';
 import {
   addAuthorizedKeyToServer,
   deleteAuthorizedKeyFromServer,
@@ -56,6 +67,7 @@ import {
   getOpenSshServiceStatus,
   installOpenSshServer,
 } from './serverB/opensshService';
+import { quicServerMgr } from './serverB/quicServerMgr';
 import {
   applySshdConfigUpdate,
   readHostPublicKey,
@@ -267,7 +279,15 @@ function createTray(): void {
 function registerIpcHandlers(): void {
   // ===== App & Environment =====
   ipcMain.handle('app:getEnvInfo', async (): Promise<EnvironmentInfo> => {
-    const isAdmin = await checkIsAdmin();
+    const settings = settingsStore.load();
+    setCustomOpenSshDir(settings.customOpenSshDir);
+    tunnelManager.setCustomHysteriaPath(settings.customHysteriaPath);
+
+    const [isAdmin, sshClientVersion, hysteriaClient] = await Promise.all([
+      checkIsAdmin(),
+      detectOpenSshVersion('ssh'),
+      inspectHysteriaBinary('clientA', settings.customHysteriaPath),
+    ]);
     const sshPath = resolveOpenSshBinary('ssh');
     const sshClientAvailable = IS_WINDOWS ? fs.existsSync(sshPath) || sshPath === 'ssh.exe' : true;
     return {
@@ -280,6 +300,8 @@ function registerIpcHandlers(): void {
       userDataDir: app.getPath('userData'),
       sshClientAvailable,
       sshClientPath: sshPath,
+      sshClientVersion,
+      hysteriaClient,
     };
   });
 
@@ -287,6 +309,8 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle('app:updateSettings', (_e, patch: Partial<AppSettings>) => {
     const updated = settingsStore.update(patch);
+    setCustomOpenSshDir(updated.customOpenSshDir);
+    tunnelManager.setCustomHysteriaPath(updated.customHysteriaPath);
     updateTrayUI();
     return updated;
   });
@@ -324,6 +348,16 @@ function registerIpcHandlers(): void {
     }
   );
 
+  ipcMain.handle('app:selectDirectory', async (_e, title: string) => {
+    if (!mainWindow) return null;
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title,
+      properties: ['openDirectory'],
+    });
+    if (result.canceled || result.filePaths.length === 0) return null;
+    return result.filePaths[0];
+  });
+
   ipcMain.handle('app:openExternal', async (_e, url: string) => {
     await shell.openExternal(url);
   });
@@ -339,6 +373,8 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle('clientA:startTunnel', async (_e, nodeId?: string) => {
     const settings = settingsStore.load();
+    setCustomOpenSshDir(settings.customOpenSshDir);
+    tunnelManager.setCustomHysteriaPath(settings.customHysteriaPath);
     const targetNode = nodeId
       ? settings.nodes.find((n) => n.id === nodeId)
       : settingsStore.getActiveNode();
@@ -373,11 +409,11 @@ function registerIpcHandlers(): void {
     runSecurityVerification(node)
   );
 
-  // ===== Client A: Browser, Diagnostics, AutoStart =====
+  // ===== Client A: Browser, Diagnostics, Engines, AutoStart =====
   ipcMain.handle('clientA:detectBrowsers', () => detectInstalledBrowsers());
   ipcMain.handle(
     'clientA:launchProxyBrowser',
-    (_e, node: Pick<NodeProfile, 'mode' | 'localPort'>, prefs: BrowserPrefs) =>
+    (_e, node: Pick<NodeProfile, 'mode' | 'localPort' | 'engine'>, prefs: BrowserPrefs) =>
       launchProxyBrowser(node, prefs)
   );
   ipcMain.handle(
@@ -389,10 +425,21 @@ function registerIpcHandlers(): void {
     settingsStore.update({ autoStart: enabled });
     return setAutoStartEnabled(enabled);
   });
+  ipcMain.handle(
+    'engine:downloadHysteria',
+    (_e, scope: 'clientA' | 'serverB', customUrl?: string) =>
+      downloadHysteriaBinary(scope, customUrl)
+  );
+  ipcMain.handle(
+    'engine:importHysteria',
+    (_e, scope: 'clientA' | 'serverB', filePath: string) =>
+      importLocalHysteriaBinary(scope, filePath)
+  );
 
   // ===== Server B =====
   ipcMain.handle('serverB:getOverview', async (): Promise<ServerOverview> => {
     const settings = settingsStore.load();
+    setCustomOpenSshDir(settings.customOpenSshDir);
     const config = readSshdConfigState();
     const [
       service,
@@ -400,6 +447,7 @@ function registerIpcHandlers(): void {
       firewallRules,
       updatePolicy,
       systemTuning,
+      quicServer,
       network,
       detectedPublicIp,
     ] = await Promise.all([
@@ -411,6 +459,7 @@ function registerIpcHandlers(): void {
       listSshFirewallRules(),
       getWindowsUpdatePolicy(),
       getServerSystemTuning(),
+      quicServerMgr.getStatus(settings.customHysteriaPath),
       inspectNetworkState(config.port),
       detectServerPublicIp(),
     ]);
@@ -422,6 +471,7 @@ function registerIpcHandlers(): void {
       firewallRules,
       updatePolicy,
       systemTuning,
+      quicServer,
       listeningPorts: network.listeningPorts,
       activeConnections: network.activeConnections,
       detectedPublicIp,
@@ -478,6 +528,15 @@ function registerIpcHandlers(): void {
     setDisableAutoReboot(disable)
   );
   ipcMain.handle('serverB:applySystemTuning', () => applyServerSystemTuning());
+  ipcMain.handle('serverB:deployQuicServer', (_e, cfg: QuicServerConfigInput) => {
+    const settings = settingsStore.load();
+    return quicServerMgr.deployAndStart(cfg, settings.customHysteriaPath);
+  });
+  ipcMain.handle('serverB:stopQuicServer', () => quicServerMgr.stop());
+  ipcMain.handle('serverB:configureQuicStartupTask', () => {
+    const settings = settingsStore.load();
+    return quicServerMgr.configureStartupTask(settings.customHysteriaPath);
+  });
 }
 
 // Single-instance lock
@@ -501,6 +560,8 @@ if (!gotLock) {
 
     const isAutoStartLaunch = process.argv.includes('--autostart');
     const settings = settingsStore.load();
+    setCustomOpenSshDir(settings.customOpenSshDir);
+    tunnelManager.setCustomHysteriaPath(settings.customHysteriaPath);
 
     registerIpcHandlers();
     createMainWindow(isAutoStartLaunch && settings.minimizeToTray);

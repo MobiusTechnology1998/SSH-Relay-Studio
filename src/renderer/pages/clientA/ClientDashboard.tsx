@@ -62,11 +62,27 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
       ? Math.max(0, Math.ceil((tunnelStatus.nextRetryAt - now) / 1000))
       : null;
 
+  const engineLabel =
+    tunnelStatus.activeEngine === 'hysteria2'
+      ? 'QUIC · Hysteria 2'
+      : tunnelStatus.fallbackActive
+      ? 'OpenSSH (QUIC 自动回退)'
+      : 'OpenSSH 多隧道池';
+
   const statusMeta = {
     disconnected: { label: '隧道未连接', badge: 'neutral' as const },
-    connecting: { label: '正在建立并行 SSH 隧道池...', badge: 'warn' as const },
+    connecting: {
+      label:
+        tunnelStatus.activeEngine === 'hysteria2'
+          ? '正在建立 QUIC 弱网加速隧道...'
+          : '正在建立并行 SSH 隧道池...',
+      badge: 'warn' as const,
+    },
     connected: {
-      label: `并行隧道运行中（${tunnelStatus.healthyWorkers}/${tunnelStatus.poolSize} 通道健康）`,
+      label:
+        tunnelStatus.activeEngine === 'hysteria2'
+          ? 'QUIC (Hysteria 2) 加速运行中'
+          : `并行隧道运行中（${tunnelStatus.healthyWorkers}/${tunnelStatus.poolSize} 通道健康）`,
       badge: 'success' as const,
     },
     reconnecting: {
@@ -153,7 +169,7 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
         <div>
           <h1 className="page-title">隧道控制台</h1>
           <p className="page-desc">
-            多隧道并行连接池 + 本地最少连接/低延迟调度器，缓解跨国弱网单 TCP 队头阻塞并实现断线无感故障转移
+            支持 OpenSSH 多隧道并行连接池与 Hysteria 2 QUIC 跨国弱网引擎（UDP 受阻时自动无缝回退 OpenSSH）
           </p>
         </div>
         <div className="header-actions">
@@ -178,7 +194,10 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
           <div style={{ minWidth: 0 }}>
             <div className="hero-status-title">
               <span>{statusMeta.label}</span>
-              <StatusBadge variant={statusMeta.badge} label={tunnelStatus.state.toUpperCase()} />
+              <StatusBadge variant={statusMeta.badge} label={engineLabel} />
+              {tunnelStatus.fallbackActive && (
+                <StatusBadge variant="warn" label="已容灾回退" />
+              )}
             </div>
             <div className="hero-status-meta">
               {activeNode ? (
@@ -187,7 +206,9 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
                     节点：<strong>{activeNode.name}</strong>
                   </span>
                   <span className="mono">
-                    {activeNode.username}@{activeNode.host}:{activeNode.sshPort}
+                    {activeNode.engine === 'hysteria2' && !tunnelStatus.fallbackActive
+                      ? `QUIC ${activeNode.host}:${activeNode.quicUdpPort ?? 53623}`
+                      : `${activeNode.username}@${activeNode.host}:${activeNode.sshPort}`}
                   </span>
                   <span className="mono">
                     本地入口：
