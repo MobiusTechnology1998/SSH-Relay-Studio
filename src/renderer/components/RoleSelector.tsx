@@ -33,14 +33,14 @@ export const RoleSelector: React.FC<RoleSelectorProps> = ({ onSelect }) => {
             <div>
               <h2>我是设备 A（使用端）</h2>
               <p style={{ marginTop: 4 }}>
-                日常办公或受限网络电脑，需要通过设备 B 的加密 SSH 隧道安全访问外网。
+                日常办公或跨国弱网电脑，通过设备 B 的 QUIC / SSH 加密中转稳定高速访问外网。
               </p>
             </div>
             <ul className="role-feature-list">
-              <li>内置 SSH 进程守护，断线 5 秒自动重连与系统托盘常驻</li>
-              <li>一键生成 ed25519 密钥、导入 B 端配对码与指纹信任</li>
-              <li>一键启动全站代理隔离浏览器（Edge / Chrome）</li>
-              <li>支持标准 SOCKS5 (-D) 与上游代理转发 (-L) 双模式</li>
+              <li>QUIC (Hysteria 2) 跨国弱网加速 + OpenSSH 多隧道池，UDP 受阻自动回退</li>
+              <li>2 步极速配对：一键复制本机公钥 + 粘贴配对码自动信任指纹</li>
+              <li>端到端主动探活、系统休眠唤醒秒级恢复与无感连接轮换</li>
+              <li>一键启动独立全站代理浏览器（Edge / Chrome）与终端代理变量</li>
             </ul>
             <div style={{ marginTop: 'auto', paddingTop: 6 }}>
               <span className="btn btn-primary" style={{ width: '100%' }}>
@@ -60,14 +60,14 @@ export const RoleSelector: React.FC<RoleSelectorProps> = ({ onSelect }) => {
             <div>
               <h2>我是设备 B（中转端）</h2>
               <p style={{ marginTop: 4 }}>
-                具备完整外网权限的 Windows 主机或海外云服务器，提供 OpenSSH 加密中转服务。
+                具备完整外网权限的 Windows 主机或海外云服务器，提供 QUIC 与 OpenSSH 加密中转。
               </p>
             </div>
             <ul className="role-feature-list">
-              <li>一键安装启动 OpenSSH Server 并配置崩溃 5 秒自愈</li>
-              <li>防锁死端口迁移向导：自动校验 sshd_config 并备份回滚</li>
-              <li>公钥追加管理 + 自动 icacls 权限收紧（管理员专属路径）</li>
-              <li>禁止 Windows 更新自动重启 + 实时来源 IP 反查与配对码导出</li>
+              <li>首页「一键全自动部署与优化」：装 OpenSSH、加固端口、配自愈与 TCP 调优</li>
+              <li>可选内置 QUIC (Hysteria 2) 服务端：自动签发证书与 Salamander 防限速混淆</li>
+              <li>设备公钥追加 + 自动 ACL 权限收紧 + 实时来源 IP 反查</li>
+              <li>一键生成并复制配对码（含主机指纹与 QUIC 凭证），A 端粘贴即连</li>
             </ul>
             <div style={{ marginTop: 'auto', paddingTop: 6 }}>
               <span

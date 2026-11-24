@@ -434,74 +434,77 @@ export const ClientTools: React.FC<ClientToolsProps> = ({
       </div>
 
       {/* Terminal / API Proxy Snippets */}
-      <div className="card stack-sm">
-        <div className="card-header" style={{ marginBottom: 4 }}>
-          <div>
-            <h3 className="card-title">
-              <IconTerminal size={17} />
-              终端与代码 API 代理环境变量
-            </h3>
-            <p className="card-subtitle">
-              使用 <code className="mono">socks5h://</code> 强制由设备 B 解析域名；Python 调用 OpenAI/httpx 请安装{' '}
-              <code className="mono">httpx[socks]</code>
-            </p>
+      <details className="advanced-drawer">
+        <summary>
+          <span className="row-wrap" style={{ gap: 8 }}>
+            <IconTerminal size={16} />
+            <span>终端与代码 API 代理环境变量（PowerShell / CMD / Bash / curl）</span>
+          </span>
+          <span className="mono" style={{ fontSize: 11.5, color: 'var(--text-muted)' }}>
+            127.0.0.1:{proxyTarget.localPort}
+          </span>
+        </summary>
+        <div className="advanced-drawer-body">
+          <p className="card-subtitle">
+            使用 <code className="mono">socks5h://</code> 强制由设备 B 解析域名；Python 调用 OpenAI/httpx 请安装{' '}
+            <code className="mono">httpx[socks]</code>
+          </p>
+
+          <div className="grid-2">
+            <div className="field">
+              <div className="row-between">
+                <span className="field-label">PowerShell</span>
+                <button
+                  className="btn btn-sm btn-ghost"
+                  onClick={() => handleCopy('PowerShell', snippets.powershell)}
+                >
+                  <IconCopy size={13} /> 复制
+                </button>
+              </div>
+              <div className="code-block">{snippets.powershell}</div>
+            </div>
+
+            <div className="field">
+              <div className="row-between">
+                <span className="field-label">CMD / 批处理</span>
+                <button
+                  className="btn btn-sm btn-ghost"
+                  onClick={() => handleCopy('CMD', snippets.cmd)}
+                >
+                  <IconCopy size={13} /> 复制
+                </button>
+              </div>
+              <div className="code-block">{snippets.cmd}</div>
+            </div>
+
+            <div className="field">
+              <div className="row-between">
+                <span className="field-label">Git Bash / WSL</span>
+                <button
+                  className="btn btn-sm btn-ghost"
+                  onClick={() => handleCopy('Bash', snippets.bash)}
+                >
+                  <IconCopy size={13} /> 复制
+                </button>
+              </div>
+              <div className="code-block">{snippets.bash}</div>
+            </div>
+
+            <div className="field">
+              <div className="row-between">
+                <span className="field-label">curl 出口 IP 验证</span>
+                <button
+                  className="btn btn-sm btn-ghost"
+                  onClick={() => handleCopy('curl', snippets.curlTest)}
+                >
+                  <IconCopy size={13} /> 复制
+                </button>
+              </div>
+              <div className="code-block">{snippets.curlTest}</div>
+            </div>
           </div>
         </div>
-
-        <div className="grid-2">
-          <div className="field">
-            <div className="row-between">
-              <span className="field-label">PowerShell</span>
-              <button
-                className="btn btn-sm btn-ghost"
-                onClick={() => handleCopy('PowerShell', snippets.powershell)}
-              >
-                <IconCopy size={13} /> 复制
-              </button>
-            </div>
-            <div className="code-block">{snippets.powershell}</div>
-          </div>
-
-          <div className="field">
-            <div className="row-between">
-              <span className="field-label">CMD / 批处理</span>
-              <button
-                className="btn btn-sm btn-ghost"
-                onClick={() => handleCopy('CMD', snippets.cmd)}
-              >
-                <IconCopy size={13} /> 复制
-              </button>
-            </div>
-            <div className="code-block">{snippets.cmd}</div>
-          </div>
-
-          <div className="field">
-            <div className="row-between">
-              <span className="field-label">Git Bash / WSL</span>
-              <button
-                className="btn btn-sm btn-ghost"
-                onClick={() => handleCopy('Bash', snippets.bash)}
-              >
-                <IconCopy size={13} /> 复制
-              </button>
-            </div>
-            <div className="code-block">{snippets.bash}</div>
-          </div>
-
-          <div className="field">
-            <div className="row-between">
-              <span className="field-label">curl 出口 IP 验证</span>
-              <button
-                className="btn btn-sm btn-ghost"
-                onClick={() => handleCopy('curl', snippets.curlTest)}
-              >
-                <IconCopy size={13} /> 复制
-              </button>
-            </div>
-            <div className="code-block">{snippets.curlTest}</div>
-          </div>
-        </div>
-      </div>
+      </details>
     </div>
   );
 };

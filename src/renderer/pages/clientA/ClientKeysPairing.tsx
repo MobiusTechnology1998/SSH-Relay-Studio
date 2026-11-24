@@ -61,7 +61,7 @@ export const ClientKeysPairing: React.FC<ClientKeysPairingProps> = ({
   const handleCopyPubKey = async () => {
     if (!keyInfo?.publicKey) return;
     await window.relayApi.copyText(keyInfo.publicKey);
-    onNotify('success', '已复制设备 A 公钥，请粘贴到设备 B 的「授权公钥管理」中');
+    onNotify('success', '已复制设备 A 公钥，请粘贴到设备 B 首页第 1 步（或「设备公钥与连接」）');
   };
 
   const handleScanHostKey = async () => {
@@ -150,7 +150,7 @@ export const ClientKeysPairing: React.FC<ClientKeysPairingProps> = ({
             />
           </div>
           <p className="step-desc">
-            自动生成空密码短语的 ed25519 密钥对以支持后台断线全自动重连。复制下方公钥粘贴到设备 B 应用的「授权公钥管理」中，B 端会自动追加且执行 icacls 收紧权限。
+            自动生成空密码短语的 ed25519 密钥对以支持后台断线全自动重连。复制下方公钥粘贴到设备 B 首页第 1 步（或「设备公钥与连接」）中，B 端会自动追加并执行 ACL 权限收紧。
           </p>
 
           {keyInfo?.exists ? (

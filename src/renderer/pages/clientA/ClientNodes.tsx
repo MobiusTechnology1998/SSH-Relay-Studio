@@ -178,7 +178,7 @@ export const ClientNodes: React.FC<ClientNodesProps> = ({
         <div className="card" style={{ textAlign: 'center', padding: '42px 24px' }}>
           <h3 style={{ margin: '0 0 8px' }}>尚未添加中转节点</h3>
           <p className="card-subtitle" style={{ marginBottom: 18 }}>
-            可在设备 B 的仪表盘点击「生成配对码」后粘贴导入，或点击下方手动填写设备 B 的 IP 和高位端口。
+            可在设备 B 首页点击「一键生成并复制配对码」后粘贴导入，或点击下方手动填写设备 B 的 IP 和高位端口。
           </p>
           <div className="row-wrap" style={{ justifyContent: 'center' }}>
             <button className="btn btn-primary" onClick={() => setImportOpen(true)}>
