@@ -54,16 +54,35 @@ export async function allowFirewallPort(port: number): Promise<ActionResult> {
   const displayName =
     port === 22 ? 'OpenSSH Server (sshd)' : `OpenSSH Server (TCP ${port})`;
 
+  // Fact-first idempotent rule management:
+  // 1. If any enabled Inbound Allow rule already covers TCP <port>, reuse it without creating duplicates.
+  // 2. If a disabled Inbound Allow rule already exists for TCP <port>, re-enable it in place.
+  // 3. Only create a new rule if none exists.
   const psScript = `
     $ErrorActionPreference = 'Stop'
-    $existing = Get-NetFirewallRule -Name '${ruleName}' -ErrorAction SilentlyContinue
-    if ($null -ne $existing) {
-      Enable-NetFirewallRule -Name '${ruleName}'
-      Set-NetFirewallRule -Name '${ruleName}' -Action Allow -Direction Inbound
+    $allInbound = Get-NetFirewallRule -Direction Inbound -Action Allow -ErrorAction SilentlyContinue
+    $matchingEnabled = $null
+    $matchingDisabled = $null
+    foreach ($r in $allInbound) {
+      $pf = $r | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue
+      if ($pf -and ($pf.Protocol -eq 'TCP' -or $pf.Protocol -eq 'Any') -and ($pf.LocalPort -contains '${port}' -or $pf.LocalPort -eq '${port}')) {
+        if ($r.Enabled.ToString() -eq 'True') {
+          $matchingEnabled = $r
+          break
+        } elseif ($null -eq $matchingDisabled) {
+          $matchingDisabled = $r
+        }
+      }
+    }
+    if ($null -ne $matchingEnabled) {
+      Write-Output "REUSED:$($matchingEnabled.Name)"
+    } elseif ($null -ne $matchingDisabled) {
+      Enable-NetFirewallRule -Name $matchingDisabled.Name
+      Write-Output "ENABLED:$($matchingDisabled.Name)"
     } else {
       New-NetFirewallRule -Name '${ruleName}' -DisplayName '${displayName}' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort ${port} | Out-Null
+      Write-Output "CREATED:${ruleName}"
     }
-    Write-Output 'OK'
   `;
 
   const res = await runPowerShell(psScript, 15000);
@@ -71,6 +90,24 @@ export async function allowFirewallPort(port: number): Promise<ActionResult> {
     const msg = `放行防火墙端口 ${port} 失败: ${res.stderr.trim() || res.stdout.trim()}`;
     logger.error('serverB', msg);
     return { ok: false, message: msg };
+  }
+
+  const out = res.stdout.trim();
+  if (out.startsWith('REUSED:')) {
+    const existingName = out.slice('REUSED:'.length);
+    logger.info('serverB', `防火墙 TCP ${port} 已有生效放行规则 (${existingName})，跳过重复创建`);
+    return {
+      ok: true,
+      message: `TCP ${port} 已有生效放行规则 (${existingName})，无需重复添加`,
+    };
+  }
+  if (out.startsWith('ENABLED:')) {
+    const existingName = out.slice('ENABLED:'.length);
+    logger.success('serverB', `已重新启用已有防火墙规则 ${existingName} (TCP ${port})`);
+    return {
+      ok: true,
+      message: `已启用既有防火墙规则 ${existingName} (TCP ${port})`,
+    };
   }
 
   logger.success('serverB', `已放行 Windows 防火墙入站规则 ${ruleName} (TCP ${port})`);
@@ -93,14 +130,29 @@ export async function allowUdpFirewallPort(port: number): Promise<ActionResult> 
 
   const psScript = `
     $ErrorActionPreference = 'Stop'
-    $existing = Get-NetFirewallRule -Name '${ruleName}' -ErrorAction SilentlyContinue
-    if ($null -ne $existing) {
-      Enable-NetFirewallRule -Name '${ruleName}'
-      Set-NetFirewallRule -Name '${ruleName}' -Action Allow -Direction Inbound
+    $allInbound = Get-NetFirewallRule -Direction Inbound -Action Allow -ErrorAction SilentlyContinue
+    $matchingEnabled = $null
+    $matchingDisabled = $null
+    foreach ($r in $allInbound) {
+      $pf = $r | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue
+      if ($pf -and ($pf.Protocol -eq 'UDP' -or $pf.Protocol -eq 'Any') -and ($pf.LocalPort -contains '${port}' -or $pf.LocalPort -eq '${port}')) {
+        if ($r.Enabled.ToString() -eq 'True') {
+          $matchingEnabled = $r
+          break
+        } elseif ($null -eq $matchingDisabled) {
+          $matchingDisabled = $r
+        }
+      }
+    }
+    if ($null -ne $matchingEnabled) {
+      Write-Output "REUSED:$($matchingEnabled.Name)"
+    } elseif ($null -ne $matchingDisabled) {
+      Enable-NetFirewallRule -Name $matchingDisabled.Name
+      Write-Output "ENABLED:$($matchingDisabled.Name)"
     } else {
       New-NetFirewallRule -Name '${ruleName}' -DisplayName '${displayName}' -Enabled True -Direction Inbound -Protocol UDP -Action Allow -LocalPort ${port} | Out-Null
+      Write-Output "CREATED:${ruleName}"
     }
-    Write-Output 'OK'
   `;
 
   const res = await runPowerShell(psScript, 15000);
@@ -108,6 +160,24 @@ export async function allowUdpFirewallPort(port: number): Promise<ActionResult> 
     const msg = `放行防火墙 UDP 端口 ${port} 失败: ${res.stderr.trim() || res.stdout.trim()}`;
     logger.error('serverB', msg);
     return { ok: false, message: msg };
+  }
+
+  const out = res.stdout.trim();
+  if (out.startsWith('REUSED:')) {
+    const existingName = out.slice('REUSED:'.length);
+    logger.info('serverB', `防火墙 UDP ${port} 已有生效放行规则 (${existingName})，跳过重复创建`);
+    return {
+      ok: true,
+      message: `UDP ${port} 已有生效放行规则 (${existingName})，无需重复添加`,
+    };
+  }
+  if (out.startsWith('ENABLED:')) {
+    const existingName = out.slice('ENABLED:'.length);
+    logger.success('serverB', `已重新启用已有防火墙规则 ${existingName} (UDP ${port})`);
+    return {
+      ok: true,
+      message: `已启用既有防火墙规则 ${existingName} (UDP ${port})`,
+    };
   }
 
   logger.success('serverB', `已放行 Windows 防火墙入站规则 ${ruleName} (UDP ${port})`);

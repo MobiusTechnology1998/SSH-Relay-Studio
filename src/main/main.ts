@@ -418,7 +418,7 @@ function registerIpcHandlers(): void {
   ipcMain.handle(
     'clientA:launchProxyBrowser',
     (_e, node: Pick<NodeProfile, 'mode' | 'localPort' | 'engine'>, prefs: BrowserPrefs) =>
-      launchProxyBrowser(node, prefs)
+      launchProxyBrowser(node, prefs, tunnelManager.getStatus().fallbackActive)
   );
   ipcMain.handle(
     'clientA:runDiagnostics',

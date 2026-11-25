@@ -91,7 +91,8 @@ export function resolveDefaultBrowserProfileDir(browserId: BrowserPrefs['selecte
 
 export function launchProxyBrowser(
   node: Pick<NodeProfile, 'mode' | 'localPort' | 'engine'>,
-  prefs: BrowserPrefs
+  prefs: BrowserPrefs,
+  fallbackActive = false
 ): ActionResult {
   const detected = detectInstalledBrowsers();
   let exePath = '';
@@ -118,7 +119,7 @@ export function launchProxyBrowser(
   const userDataDir = rawUserDataDir
     ? expandWindowsEnvVars(rawUserDataDir)
     : resolveDefaultBrowserProfileDir(prefs.selectedBrowser);
-  const args = buildBrowserLaunchArgs(node, prefs, userDataDir);
+  const args = buildBrowserLaunchArgs(node, prefs, userDataDir, fallbackActive);
 
   try {
     const child = spawn(exePath, args, {

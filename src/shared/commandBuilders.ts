@@ -1,4 +1,9 @@
-import type { BrowserPrefs, NodeProfile } from './types';
+import type {
+  BrowserPrefs,
+  FirewallRuleInfo,
+  NodeProfile,
+  PairingPayload,
+} from './types';
 
 /**
  * Builds the exact ssh.exe argument array for either:
@@ -87,15 +92,31 @@ export function formatSshCommandPreview(node: NodeProfile, resolvedKeyPath?: str
 }
 
 /**
+ * Single source of truth for whether Chromium's `--disable-quic` flag (disabling browser HTTP/3)
+ * will be passed for a given node + browser preference.
+ * OpenSSH `-D` cannot tunnel UDP/QUIC so disabling browser HTTP/3 prevents 200ms~1s fallback delays;
+ * Hysteria 2 natively supports UDP ASSOCIATE so browser HTTP/3 stays enabled unless fallen back to SSH.
+ */
+export function shouldDisableBrowserHttp3(
+  node: Pick<NodeProfile, 'mode' | 'engine'> | null | undefined,
+  prefs: Pick<BrowserPrefs, 'disableQuic'>,
+  fallbackActive = false
+): boolean {
+  if (!node) return false;
+  const effectiveEngine = fallbackActive ? 'openssh' : (node.engine ?? 'openssh');
+  return node.mode === 'socks5' && effectiveEngine !== 'hysteria2' && prefs.disableQuic !== false;
+}
+
+/**
  * Builds Chromium (Edge / Chrome) arguments for isolated full-site proxy browsing.
  * - Avoids `--host-resolver-rules` by default to prevent warning banners.
- * - Adds `--disable-quic` by default in SOCKS5 mode because OpenSSH `-D` only tunnels TCP
- *   and cannot carry HTTP/3 (QUIC/UDP), preventing 200ms~1s fallback delays on Cloudflare/Google/OpenAI.
+ * - Adds `--disable-quic` by default in OpenSSH SOCKS5 mode (not Hysteria 2 QUIC mode).
  */
 export function buildBrowserLaunchArgs(
   node: Pick<NodeProfile, 'mode' | 'localPort' | 'engine'>,
   prefs: BrowserPrefs,
-  resolvedUserDataDir: string
+  resolvedUserDataDir: string,
+  fallbackActive = false
 ): string[] {
   const proxyScheme = node.mode === 'localForward' ? 'http' : 'socks5';
   const args: string[] = [
@@ -103,8 +124,7 @@ export function buildBrowserLaunchArgs(
     `--user-data-dir=${resolvedUserDataDir}`,
   ];
 
-  // OpenSSH -D cannot tunnel UDP/QUIC; Hysteria 2 natively supports UDP ASSOCIATE so keep QUIC enabled there
-  if (node.mode === 'socks5' && node.engine !== 'hysteria2' && prefs.disableQuic !== false) {
+  if (shouldDisableBrowserHttp3(node, prefs, fallbackActive)) {
     args.push('--disable-quic');
   }
 
@@ -370,4 +390,139 @@ export function isPort22FirewallRule(rule: {
     .split(/[,\s]+/)
     .map((t) => t.trim());
   return tokens.includes('22');
+}
+
+/**
+ * Checks whether the discovered Windows Firewall rules already contain an enabled Allow rule
+ * covering the given protocol ('TCP' | 'UDP') and port number (including port ranges like `53620-53625`).
+ */
+export function isFirewallPortAllowed(
+  rules: ReadonlyArray<Pick<FirewallRuleInfo, 'name' | 'displayName' | 'enabled' | 'action' | 'localPort'>>,
+  protocol: 'TCP' | 'UDP',
+  port: number
+): Pick<FirewallRuleInfo, 'name' | 'displayName' | 'enabled' | 'action' | 'localPort'> | undefined {
+  const protoUpper = protocol.toUpperCase();
+  return rules.find((rule) => {
+    if (!rule.enabled) return false;
+    if (rule.action && !/^allow$/i.test(rule.action.trim())) return false;
+    const raw = (rule.localPort || '').trim();
+    if (!raw) return false;
+    const protoMatch = raw.match(/^(TCP|UDP|Any)\s+(.*)$/i);
+    let portSpec = raw;
+    if (protoMatch) {
+      const ruleProto = protoMatch[1].toUpperCase();
+      if (ruleProto !== 'ANY' && ruleProto !== protoUpper) return false;
+      portSpec = protoMatch[2];
+    } else if (protoUpper === 'UDP') {
+      // Unprefixed legacy port numbers are TCP unless rule name explicitly indicates UDP
+      if (!/udp/i.test(rule.name) && !/udp/i.test(rule.displayName)) return false;
+    }
+
+    const tokens = portSpec
+      .split(/[,\s]+/)
+      .map((t) => t.trim())
+      .filter(Boolean);
+    for (const token of tokens) {
+      if (/^any$/i.test(token)) return true;
+      if (token === String(port)) return true;
+      const range = token.match(/^(\d+)-(\d+)$/);
+      if (range) {
+        const start = Number.parseInt(range[1], 10);
+        const end = Number.parseInt(range[2], 10);
+        if (port >= start && port <= end) return true;
+      }
+    }
+    return false;
+  });
+}
+
+/**
+ * Idempotently imports a Device B pairing payload:
+ * - If a node for the same host + username (or same host + sshPort) already exists,
+ *   updates its server-side parameters (SSH port, host key, QUIC token/cert/SNI/obfs) in place
+ *   while preserving the user's custom name, localPort, privateKeyPath, and pool preferences.
+ * - Otherwise creates and appends a new NodeProfile.
+ */
+export function upsertNodeFromPairing(
+  existingNodes: ReadonlyArray<NodeProfile>,
+  payload: PairingPayload,
+  nowMs = Date.now()
+): { nodes: NodeProfile[]; targetNode: NodeProfile; updatedExisting: boolean } {
+  const normHost = payload.host.trim().toLowerCase();
+  const normUser = payload.username.trim().toLowerCase();
+  const hasQuic = Boolean(payload.quic);
+
+  const matchIdx = existingNodes.findIndex((n) => {
+    const sameHost = n.host.trim().toLowerCase() === normHost;
+    if (!sameHost) return false;
+    return n.username.trim().toLowerCase() === normUser || n.sshPort === payload.sshPort;
+  });
+
+  if (matchIdx >= 0) {
+    const prev = existingNodes[matchIdx];
+    const updated: NodeProfile = {
+      ...prev,
+      host: payload.host.trim(),
+      sshPort: payload.sshPort,
+      username: payload.username.trim(),
+      expectedHostKey: payload.hostPublicKey ?? prev.expectedHostKey,
+      engine: hasQuic ? 'hysteria2' : prev.engine ?? 'openssh',
+      autoFallbackToSsh: prev.autoFallbackToSsh ?? true,
+      quicUdpPort: payload.quic?.udpPort ?? prev.quicUdpPort ?? 53623,
+      quicAuthToken: payload.quic?.authToken ?? prev.quicAuthToken,
+      quicCertPinSha256: payload.quic?.certPinSha256 ?? prev.quicCertPinSha256,
+      quicSni: payload.quic?.sni ?? prev.quicSni ?? 'www.bing.com',
+      quicObfsPassword: payload.quic ? payload.quic.obfsPassword : prev.quicObfsPassword,
+    };
+    const nextNodes = existingNodes.map((n, idx) => (idx === matchIdx ? updated : n));
+    return { nodes: nextNodes, targetNode: updated, updatedExisting: true };
+  }
+
+  const created: NodeProfile = {
+    id: `node-${nowMs}`,
+    name: payload.name,
+    host: payload.host.trim(),
+    sshPort: payload.sshPort,
+    username: payload.username.trim(),
+    mode: 'socks5',
+    localPort: 1080,
+    remoteProxyPort: 7890,
+    privateKeyPath: '',
+    expectedHostKey: payload.hostPublicKey,
+    poolSize: 3,
+    forceIpv4: true,
+    preferFastCipher: true,
+    healthCheckEnabled: true,
+    healthCheckIntervalSec: 25,
+    engine: hasQuic ? 'hysteria2' : 'openssh',
+    autoFallbackToSsh: true,
+    quicUdpPort: payload.quic?.udpPort ?? 53623,
+    quicAuthToken: payload.quic?.authToken,
+    quicCertPinSha256: payload.quic?.certPinSha256,
+    quicSni: payload.quic?.sni ?? 'www.bing.com',
+    quicObfsPassword: payload.quic?.obfsPassword,
+    quicUpMbps: 50,
+    quicDownMbps: 200,
+  };
+
+  return {
+    nodes: [...existingNodes, created],
+    targetNode: created,
+    updatedExisting: false,
+  };
+}
+
+/**
+ * Locale-independent parser for Windows `reg.exe query` REG_DWORD lines
+ * (e.g. `    AUOptions    REG_DWORD    0x2`).
+ */
+export function parseRegQueryDwords(stdout: string): Record<string, number> {
+  const result: Record<string, number> = {};
+  for (const line of stdout.split(/\r?\n/)) {
+    const match = line.match(/^\s*(\S+)\s+REG_DWORD\s+0x([0-9a-fA-F]+)/i);
+    if (match) {
+      result[match[1]] = Number.parseInt(match[2], 16);
+    }
+  }
+  return result;
 }

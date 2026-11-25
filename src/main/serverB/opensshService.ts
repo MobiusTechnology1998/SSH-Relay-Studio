@@ -167,6 +167,11 @@ export async function configureSshdFailureRecovery(): Promise<ActionResult> {
     return { ok: false, message: '仅支持在 Windows 设备 B 上配置服务自愈' };
   }
 
+  const current = await getOpenSshServiceStatus();
+  if (current.serviceExists && current.startType === 'Automatic' && current.failureRecoveryConfigured) {
+    return { ok: true, message: 'sshd 开机自启与崩溃 5 秒自愈已生效，无需重复配置' };
+  }
+
   // Set Automatic start + sc.exe failure recovery (note required space after '=' in sc.exe)
   const autoRes = await runPowerShell(
     `$ErrorActionPreference = 'Stop'; Set-Service -Name sshd -StartupType Automatic`,

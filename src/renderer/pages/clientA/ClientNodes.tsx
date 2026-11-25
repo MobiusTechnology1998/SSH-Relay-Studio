@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { formatSshCommandPreview } from '../../../shared/commandBuilders';
+import { formatSshCommandPreview, upsertNodeFromPairing } from '../../../shared/commandBuilders';
 import { decodePairingToken } from '../../../shared/pairingCodec';
 import type { AppSettings, NodeProfile } from '../../../shared/types';
 import { Modal } from '../../components/Modal';
@@ -90,32 +90,10 @@ export const ClientNodes: React.FC<ClientNodesProps> = ({
     try {
       const payload = decodePairingToken(pairingInput);
       const hasQuic = Boolean(payload.quic);
-      const newNode: NodeProfile = {
-        id: `node-${Date.now()}`,
-        name: payload.name,
-        host: payload.host,
-        sshPort: payload.sshPort,
-        username: payload.username,
-        mode: 'socks5',
-        localPort: 1080,
-        remoteProxyPort: 7890,
-        privateKeyPath: '',
-        expectedHostKey: payload.hostPublicKey,
-        poolSize: 3,
-        forceIpv4: true,
-        preferFastCipher: true,
-        healthCheckEnabled: true,
-        healthCheckIntervalSec: 25,
-        engine: hasQuic ? 'hysteria2' : 'openssh',
-        autoFallbackToSsh: true,
-        quicUdpPort: payload.quic?.udpPort ?? 53623,
-        quicAuthToken: payload.quic?.authToken,
-        quicCertPinSha256: payload.quic?.certPinSha256,
-        quicSni: payload.quic?.sni ?? 'www.bing.com',
-        quicObfsPassword: payload.quic?.obfsPassword,
-        quicUpMbps: 50,
-        quicDownMbps: 200,
-      };
+      const { nodes: nextNodes, targetNode, updatedExisting } = upsertNodeFromPairing(
+        settings.nodes,
+        payload
+      );
 
       // If pairing code embeds Device B's host public key, trust it automatically into known_hosts!
       if (payload.hostPublicKey) {
@@ -127,20 +105,20 @@ export const ClientNodes: React.FC<ClientNodesProps> = ({
         }
       }
 
-      const nextNodes = [...settings.nodes, newNode];
       await onUpdateSettings({
         nodes: nextNodes,
-        activeNodeId: newNode.id,
+        activeNodeId: targetNode.id,
       });
       setImportOpen(false);
       setPairingInput('');
+      const verb = updatedExisting ? '已原地更新既有节点' : '已导入新节点';
       onNotify(
         'success',
         hasQuic
-          ? `已导入节点「${newNode.name}」，自动启用 QUIC (Hysteria 2) 跨国加速（并已信任 SSH 指纹用于自动容灾回退）！`
+          ? `${verb}「${targetNode.name}」，已启用 QUIC (Hysteria 2) 跨国加速并同步主机指纹（无重复创建）！`
           : payload.hostPublicKey
-          ? `已导入节点「${newNode.name}」并自动写入主机指纹信任！`
-          : `已导入节点「${newNode.name}」`
+          ? `${verb}「${targetNode.name}」并同步主机指纹信任！`
+          : `${verb}「${targetNode.name}」`
       );
     } catch (err) {
       onNotify('error', (err as Error).message);

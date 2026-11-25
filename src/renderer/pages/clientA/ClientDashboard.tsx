@@ -1,5 +1,10 @@
 import React, { useEffect, useState } from 'react';
-import { computeNodeConfigHash, formatSshCommandPreview } from '../../../shared/commandBuilders';
+import {
+  computeNodeConfigHash,
+  formatSshCommandPreview,
+  shouldDisableBrowserHttp3,
+  upsertNodeFromPairing,
+} from '../../../shared/commandBuilders';
 import { decodePairingToken } from '../../../shared/pairingCodec';
 import type {
   AppSettings,
@@ -238,32 +243,10 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
     try {
       const payload = decodePairingToken(pairingInput);
       const hasQuic = Boolean(payload.quic);
-      const newNode: NodeProfile = {
-        id: `node-${Date.now()}`,
-        name: payload.name,
-        host: payload.host,
-        sshPort: payload.sshPort,
-        username: payload.username,
-        mode: 'socks5',
-        localPort: 1080,
-        remoteProxyPort: 7890,
-        privateKeyPath: '',
-        expectedHostKey: payload.hostPublicKey,
-        poolSize: 3,
-        forceIpv4: true,
-        preferFastCipher: true,
-        healthCheckEnabled: true,
-        healthCheckIntervalSec: 25,
-        engine: hasQuic ? 'hysteria2' : 'openssh',
-        autoFallbackToSsh: true,
-        quicUdpPort: payload.quic?.udpPort ?? 53623,
-        quicAuthToken: payload.quic?.authToken,
-        quicCertPinSha256: payload.quic?.certPinSha256,
-        quicSni: payload.quic?.sni ?? 'www.bing.com',
-        quicObfsPassword: payload.quic?.obfsPassword,
-        quicUpMbps: 50,
-        quicDownMbps: 200,
-      };
+      const { nodes: nextNodes, targetNode, updatedExisting } = upsertNodeFromPairing(
+        settings.nodes,
+        payload
+      );
 
       if (payload.hostPublicKey) {
         const parts = payload.hostPublicKey.trim().split(/\s+/);
@@ -275,15 +258,16 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
       }
 
       await onUpdateSettings({
-        nodes: [...settings.nodes, newNode],
-        activeNodeId: newNode.id,
+        nodes: nextNodes,
+        activeNodeId: targetNode.id,
       });
       setPairingInput('');
+      const verb = updatedExisting ? '已更新现有节点' : '已导入';
       onNotify(
         'success',
         hasQuic
-          ? `配对完成！已导入「${newNode.name}」并自动启用 QUIC 加速与主机指纹信任，点击「启动隧道」即可使用。`
-          : `配对完成！已导入「${newNode.name}」并自动信任主机指纹，点击「启动隧道」即可使用。`
+          ? `配对完成！${verb}「${targetNode.name}」并自动启用 QUIC 加速与主机指纹信任，点击「启动加速」即可使用。`
+          : `配对完成！${verb}「${targetNode.name}」并自动信任主机指纹，点击「启动加速」即可使用。`
       );
     } catch (err) {
       onNotify('error', (err as Error).message);
@@ -531,13 +515,23 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
           {/* Live Metrics */}
           <div className="grid-4">
             <div className="metric-tile">
-              <div className="metric-label">通道状态 / 活跃流</div>
+              <div className="metric-label">
+                {tunnelStatus.activeEngine === 'hysteria2' && !tunnelStatus.fallbackActive
+                  ? 'QUIC 加速通道'
+                  : '通道状态 / 活跃流'}
+              </div>
               <div className="metric-value">
-                {tunnelStatus.healthyWorkers}/{tunnelStatus.poolSize} · {tunnelStatus.activeConnections} 连接
+                {tunnelStatus.activeEngine === 'hysteria2' && !tunnelStatus.fallbackActive
+                  ? tunnelStatus.state === 'connected'
+                    ? 'QUIC 原生多路复用'
+                    : '未连接'
+                  : `${tunnelStatus.healthyWorkers}/${tunnelStatus.poolSize} · ${tunnelStatus.activeConnections} 连接`}
               </div>
               <div className="metric-sub">
                 127.0.0.1:{activeNode?.localPort ?? 1080} (
-                {activeNode?.mode === 'localForward'
+                {tunnelStatus.activeEngine === 'hysteria2' && !tunnelStatus.fallbackActive
+                  ? 'SOCKS5 + 原生 UDP'
+                  : activeNode?.mode === 'localForward'
                   ? `转发 :${activeNode.remoteProxyPort}`
                   : 'SOCKS5 调度'}
                 )
@@ -549,7 +543,9 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
                 {formatDuration(tunnelStatus.connectedSince, now)}
               </div>
               <div className="metric-sub">
-                心跳：{aliveInterval}s × {aliveCountMax} · 重连 {tunnelStatus.reconnectCount} 次
+                {tunnelStatus.activeEngine === 'hysteria2' && !tunnelStatus.fallbackActive
+                  ? `主动探活 ${activeNode?.healthCheckIntervalSec ?? 25}s · 重连 ${tunnelStatus.reconnectCount} 次`
+                  : `心跳：${aliveInterval}s × ${aliveCountMax} · 重连 ${tunnelStatus.reconnectCount} 次`}
               </div>
             </div>
             <div className="metric-tile">
@@ -560,8 +556,9 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
                   : '--'}
               </div>
               <div className="metric-sub">
-                上行 {formatBytes(tunnelStatus.totalBytesUp)} · 下行{' '}
-                {formatBytes(tunnelStatus.totalBytesDown)}
+                {tunnelStatus.activeEngine === 'hysteria2' && !tunnelStatus.fallbackActive
+                  ? 'UDP QUIC Brutal 拥塞控制'
+                  : `上行 ${formatBytes(tunnelStatus.totalBytesUp)} · 下行 ${formatBytes(tunnelStatus.totalBytesDown)}`}
               </div>
             </div>
             <div className="metric-tile">
@@ -574,8 +571,14 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
                   : '自定义'}
               </div>
               <div className="metric-sub">
-                {settings.browser.disableQuic !== false
-                  ? '已禁 QUIC（降低 HTTP/3 延迟）'
+                {activeNode?.engine === 'hysteria2' && !tunnelStatus.fallbackActive
+                  ? '已保留浏览器 HTTP/3（QUIC 原生支持）'
+                  : shouldDisableBrowserHttp3(
+                      activeNode,
+                      settings.browser,
+                      tunnelStatus.fallbackActive
+                    )
+                  ? '已禁浏览器 HTTP/3（防 SSH-TCP 延迟）'
                   : '独立用户目录，全站代理'}
               </div>
             </div>

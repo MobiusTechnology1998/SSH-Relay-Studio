@@ -1,10 +1,11 @@
+import { parseRegQueryDwords } from '../../shared/commandBuilders';
 import type {
   ActionResult,
   ServerSystemTuningState,
   WindowsUpdatePolicyState,
 } from '../../shared/types';
 import { logger } from '../logger';
-import { IS_WINDOWS, runPowerShell } from '../platform/shell';
+import { execCmd, IS_WINDOWS, runPowerShell } from '../platform/shell';
 
 export async function getWindowsUpdatePolicy(): Promise<WindowsUpdatePolicyState> {
   if (!IS_WINDOWS) {
@@ -15,44 +16,52 @@ export async function getWindowsUpdatePolicy(): Promise<WindowsUpdatePolicyState
     };
   }
 
-  const psScript = `
-    $auPath = 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU'
-    if (Test-Path $auPath) {
-      $props = Get-ItemProperty -Path $auPath -ErrorAction SilentlyContinue
-      [PSCustomObject]@{
-        auOptions = $props.AUOptions
-        noAutoRebootWithLoggedOnUsers = $props.NoAutoRebootWithLoggedOnUsers
-      } | ConvertTo-Json -Compress
-    } else {
-      '{"auOptions":null,"noAutoRebootWithLoggedOnUsers":null}'
-    }
-  `;
-
-  const res = await runPowerShell(psScript, 10000);
-  try {
-    const parsed = JSON.parse(res.stdout.trim() || '{}');
-    const auOptions = typeof parsed.auOptions === 'number' ? parsed.auOptions : null;
-    const noAutoReboot =
-      typeof parsed.noAutoRebootWithLoggedOnUsers === 'number'
-        ? parsed.noAutoRebootWithLoggedOnUsers
-        : null;
-    return {
-      auOptions,
-      noAutoRebootWithLoggedOnUsers: noAutoReboot,
-      autoRebootDisabled: auOptions === 2 && noAutoReboot === 1,
-    };
-  } catch {
+  // Fast native Win32 registry query (~20ms) instead of spawning an extra PowerShell process
+  const res = await execCmd(
+    'reg.exe',
+    ['query', 'HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU'],
+    { timeoutMs: 6000 }
+  );
+  if (res.code !== 0 || !res.stdout) {
     return {
       auOptions: null,
       noAutoRebootWithLoggedOnUsers: null,
       autoRebootDisabled: false,
     };
   }
+
+  const dwords = parseRegQueryDwords(res.stdout);
+  const auOptions = typeof dwords.AUOptions === 'number' ? dwords.AUOptions : null;
+  const noAutoReboot =
+    typeof dwords.NoAutoRebootWithLoggedOnUsers === 'number'
+      ? dwords.NoAutoRebootWithLoggedOnUsers
+      : null;
+  return {
+    auOptions,
+    noAutoRebootWithLoggedOnUsers: noAutoReboot,
+    autoRebootDisabled: auOptions === 2 && noAutoReboot === 1,
+  };
 }
 
 export async function setDisableAutoReboot(disable: boolean): Promise<ActionResult<WindowsUpdatePolicyState>> {
   if (!IS_WINDOWS) {
     return { ok: false, message: '仅支持在 Windows 设备 B 上修改 Windows Update 策略' };
+  }
+
+  const current = await getWindowsUpdatePolicy();
+  if (disable && current.autoRebootDisabled) {
+    return {
+      ok: true,
+      message: '禁止 Windows 自动更新重启策略已生效，无需重复配置',
+      data: current,
+    };
+  }
+  if (!disable && !current.autoRebootDisabled && current.auOptions === null && current.noAutoRebootWithLoggedOnUsers === null) {
+    return {
+      ok: true,
+      message: '当前已是系统默认更新策略，无需重复修改',
+      data: current,
+    };
   }
 
   const psScript = disable
@@ -190,6 +199,15 @@ export async function getServerSystemTuning(): Promise<ServerSystemTuningState> 
 export async function applyServerSystemTuning(): Promise<ActionResult<ServerSystemTuningState>> {
   if (!IS_WINDOWS) {
     return { ok: false, message: '仅支持在 Windows 设备 B 上应用系统网络与电源调优' };
+  }
+
+  const current = await getServerSystemTuning();
+  if (current.tuned && /^(cubic|ctcp)$/i.test(current.tcpCongestionProvider)) {
+    return {
+      ok: true,
+      message: `跨国弱网 TCP 与防休眠调优已生效（拥塞控制: ${current.tcpCongestionProvider}），无需重复应用`,
+      data: current,
+    };
   }
 
   const psScript = `

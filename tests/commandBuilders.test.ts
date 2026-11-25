@@ -8,9 +8,13 @@ import {
   decodeOpenSshOctalEscapes,
   diagnoseSshError,
   formatKnownHostsTarget,
+  isFirewallPortAllowed,
   isHardSshAuthFailure,
   isNonFatalChannelOpenError,
   isPort22FirewallRule,
+  parseRegQueryDwords,
+  shouldDisableBrowserHttp3,
+  upsertNodeFromPairing,
 } from '../src/shared/commandBuilders';
 import { parseScQfailureOutput } from '../src/main/serverB/opensshService';
 import {
@@ -256,5 +260,80 @@ describe('commandBuilders', () => {
     expect(h1).toBe(h2);
     expect(h1).not.toBe(h3);
     expect(h1).not.toBe(h4);
+  });
+
+  it('keeps browser HTTP/3 enabled on Hysteria 2 QUIC and disables it on OpenSSH SOCKS5 or fallback', () => {
+    const prefs: BrowserPrefs = {
+      selectedBrowser: 'chrome',
+      customBrowserPath: '',
+      userDataDir: '',
+      useHostResolverRules: false,
+      disableQuic: true,
+      startUrl: '',
+    };
+    const quicNode: NodeProfile = { ...BASE_NODE, engine: 'hysteria2' };
+    expect(shouldDisableBrowserHttp3(quicNode, prefs, false)).toBe(false);
+    expect(shouldDisableBrowserHttp3(quicNode, prefs, true)).toBe(true);
+    expect(shouldDisableBrowserHttp3(BASE_NODE, prefs, false)).toBe(true);
+    expect(buildBrowserLaunchArgs(quicNode, prefs, 'C:\\Profile', false)).not.toContain('--disable-quic');
+    expect(buildBrowserLaunchArgs(quicNode, prefs, 'C:\\Profile', true)).toContain('--disable-quic');
+  });
+
+  it('matches discovered Windows Firewall rules by protocol, port, and port ranges', () => {
+    const rules = [
+      { name: 'SSH-Port-53622', displayName: 'SSH', enabled: true, action: 'Allow', localPort: 'TCP 53622' },
+      { name: 'Hysteria2-UDP-53623', displayName: 'QUIC', enabled: true, action: 'Allow', localPort: 'UDP 53620-53625' },
+      { name: 'Disabled-Rule', displayName: 'Old', enabled: false, action: 'Allow', localPort: 'TCP 60000' },
+    ];
+    expect(isFirewallPortAllowed(rules, 'TCP', 53622)?.name).toBe('SSH-Port-53622');
+    expect(isFirewallPortAllowed(rules, 'TCP', 53623)).toBeUndefined();
+    expect(isFirewallPortAllowed(rules, 'UDP', 53623)?.name).toBe('Hysteria2-UDP-53623');
+    expect(isFirewallPortAllowed(rules, 'UDP', 53699)).toBeUndefined();
+    expect(isFirewallPortAllowed(rules, 'TCP', 60000)).toBeUndefined();
+  });
+
+  it('upserts pairing codes in place instead of creating duplicate nodes for the same host', () => {
+    const payload = {
+      version: 1 as const,
+      name: '中转端 (WIN-B)',
+      host: '203.0.113.10',
+      sshPort: 53622,
+      username: 'Administrator',
+      hostPublicKey: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest',
+      quic: {
+        udpPort: 53623,
+        authToken: 'tok123',
+        certPinSha256: 'AA:BB',
+        sni: 'www.bing.com',
+        obfsPassword: 'obfs',
+      },
+      createdAt: 1000,
+    };
+
+    const updated = upsertNodeFromPairing([BASE_NODE], payload, 2000);
+    expect(updated.updatedExisting).toBe(true);
+    expect(updated.nodes).toHaveLength(1);
+    expect(updated.targetNode.id).toBe(BASE_NODE.id);
+    expect(updated.targetNode.name).toBe(BASE_NODE.name);
+    expect(updated.targetNode.engine).toBe('hysteria2');
+    expect(updated.targetNode.quicAuthToken).toBe('tok123');
+
+    const created = upsertNodeFromPairing(updated.nodes, { ...payload, host: '198.51.100.22' }, 3000);
+    expect(created.updatedExisting).toBe(false);
+    expect(created.nodes).toHaveLength(2);
+  });
+
+  it('parses Windows reg.exe query REG_DWORD output regardless of OS language', () => {
+    const out = [
+      '',
+      'HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU',
+      '    AUOptions    REG_DWORD    0x2',
+      '    NoAutoRebootWithLoggedOnUsers    REG_DWORD    0x1',
+      '',
+    ].join('\r\n');
+    expect(parseRegQueryDwords(out)).toEqual({
+      AUOptions: 2,
+      NoAutoRebootWithLoggedOnUsers: 1,
+    });
   });
 });

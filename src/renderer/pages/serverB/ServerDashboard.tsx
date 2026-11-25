@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { isPort22FirewallRule } from '../../../shared/commandBuilders';
+import { isFirewallPortAllowed, isPort22FirewallRule } from '../../../shared/commandBuilders';
 import { encodePairingToken } from '../../../shared/pairingCodec';
 import type { EnvironmentInfo, ServerOverview } from '../../../shared/types';
 import { IconCheck, IconCopy, IconRefresh, IconServer } from '../../components/Icons';
@@ -63,15 +63,20 @@ export const ServerDashboard: React.FC<ServerDashboardProps> = ({
   const sshHardened = Boolean(
     svcRunning &&
       overview &&
+      overview.config.port === targetPort &&
       overview.config.port !== 22 &&
       overview.config.pubkeyAuthentication &&
       !overview.config.passwordAuthentication &&
+      Boolean(isFirewallPortAllowed(overview.firewallRules, 'TCP', targetPort)) &&
       overview.service.failureRecoveryConfigured &&
       overview.updatePolicy.autoRebootDisabled &&
       overview.systemTuning.tuned
   );
   const quicReady = Boolean(
-    overview?.quicServer.running && overview?.quicServer.configured
+    overview?.quicServer.running &&
+      overview?.quicServer.configured &&
+      overview?.quicServer.udpPort === quicUdpPort &&
+      overview?.quicServer.startupTaskConfigured
   );
   const step2Done = sshHardened && (!enableQuic || quicReady);
 
@@ -96,9 +101,9 @@ export const ServerDashboard: React.FC<ServerDashboardProps> = ({
   };
 
   /**
-   * True 1-click turnkey provisioning for Device B:
-   * Installs/starts OpenSSH -> opens firewall -> writes hardened weak-network sshd_config -> restarts sshd
-   * -> enables 5s crash recovery + anti-reboot + TCP CUBIC/anti-sleep -> optionally installs & starts QUIC Hysteria 2.
+   * Fact-driven, idempotent 1-click turnkey provisioning for Device B:
+   * Inspects live discovered state first and ONLY executes steps that are not yet satisfied
+   * (never duplicates rules, never restarts already-hardened sshd, never re-registers matching tasks).
    */
   const handleOneClickDeploy = async () => {
     if (!step1Done) {
@@ -107,9 +112,9 @@ export const ServerDashboard: React.FC<ServerDashboardProps> = ({
     }
 
     const steps: DeployLogItem[] = [
-      { label: '1. 安装并启动 OpenSSH Server', state: 'pending' },
-      { label: `2. 放行 TCP ${targetPort}、加固 sshd_config（禁用密码 + 弱网高并发）并重启`, state: 'pending' },
-      { label: '3. 配置崩溃 5s 自愈、禁自动更新重启与跨国弱网 TCP 调优', state: 'pending' },
+      { label: '1. 检查并启动 OpenSSH Server', state: 'pending' },
+      { label: `2. 放行 TCP ${targetPort}、加固 sshd_config（禁用密码 + 弱网高并发）`, state: 'pending' },
+      { label: '3. 检查崩溃 5s 自愈、禁自动更新重启与跨国弱网 TCP 调优', state: 'pending' },
     ];
     if (enableQuic) {
       steps.push({ label: `4. 部署并启动 QUIC (Hysteria 2) 跨国弱网引擎 (UDP ${quicUdpPort})`, state: 'pending' });
@@ -123,70 +128,107 @@ export const ServerDashboard: React.FC<ServerDashboardProps> = ({
     };
 
     try {
+      // Discover latest real system facts before making any changes
+      const fresh = await window.relayApi.getServerOverview(false);
+
       // Step 1: OpenSSH Server
       mark(0, 'active');
-      if (!svcRunning) {
+      if (fresh.service.status === 'Running') {
+        mark(0, 'done', '已运行（跳过）');
+      } else {
         const installRes = await window.relayApi.installOpenSshServer();
         if (!installRes.ok) {
           mark(0, 'error', installRes.message);
           onNotify('error', installRes.message);
           return;
         }
+        mark(0, 'done', '已启动');
       }
-      mark(0, 'done', '已运行');
 
-      // Step 2: Firewall + Hardened Weak-Network sshd_config + Restart
+      // Step 2: Firewall + Hardened Weak-Network sshd_config + Restart (only if drifted)
       mark(1, 'active');
-      const fwRes = await window.relayApi.allowFirewallPort(targetPort);
-      if (!fwRes.ok) {
-        mark(1, 'error', fwRes.message);
-        onNotify('error', fwRes.message);
-        return;
+      const tcpAlreadyAllowed = Boolean(
+        isFirewallPortAllowed(fresh.firewallRules, 'TCP', targetPort)
+      );
+      if (!tcpAlreadyAllowed) {
+        const fwRes = await window.relayApi.allowFirewallPort(targetPort);
+        if (!fwRes.ok) {
+          mark(1, 'error', fwRes.message);
+          onNotify('error', fwRes.message);
+          return;
+        }
       }
-      const cfgRes = await window.relayApi.applySshdConfig({
-        port: targetPort,
-        pubkeyAuthentication: true,
-        passwordAuthentication: false,
-        tcpKeepAlive: true,
-        clientAliveInterval: 30,
-        clientAliveCountMax: 3,
-        useDns: false,
-        compression: 'no',
-        maxSessions: 64,
-        maxStartups: '30:50:100',
-      });
-      if (!cfgRes.ok) {
-        mark(1, 'error', cfgRes.message);
-        onNotify('error', cfgRes.message);
-        return;
-      }
-      const restartRes = await window.relayApi.controlSshdService('restart');
-      if (!restartRes.ok) {
-        mark(1, 'error', restartRes.message);
-        onNotify('error', restartRes.message);
-        return;
-      }
-      mark(1, 'done', `TCP ${targetPort} 已生效`);
 
-      // Step 3: Crash recovery + Anti-reboot + TCP CUBIC / Anti-sleep
-      mark(2, 'active');
-      const [r1, r2, r3] = await Promise.all([
-        window.relayApi.configureSshdFailureRecovery(),
-        window.relayApi.setDisableAutoReboot(true),
-        window.relayApi.applyServerSystemTuning(),
-      ]);
-      const stErrs = [r1, r2, r3].filter((r) => !r.ok).map((r) => r.message);
-      if (stErrs.length > 0) {
-        mark(2, 'error', stErrs.join(' | '));
-        onNotify('warn', `部分稳定性项未完全生效：${stErrs[0]}`);
+      const cfgAlreadyOptimal =
+        fresh.config.port === targetPort &&
+        fresh.config.pubkeyAuthentication &&
+        !fresh.config.passwordAuthentication &&
+        fresh.config.tcpKeepAlive &&
+        fresh.config.clientAliveInterval > 0 &&
+        fresh.config.clientAliveCountMax >= 1 &&
+        !fresh.config.useDns &&
+        fresh.config.compression === 'no' &&
+        fresh.config.maxSessions >= 64;
+
+      if (!cfgAlreadyOptimal) {
+        const cfgRes = await window.relayApi.applySshdConfig({
+          port: targetPort,
+          pubkeyAuthentication: true,
+          passwordAuthentication: false,
+          tcpKeepAlive: true,
+          clientAliveInterval: 30,
+          clientAliveCountMax: 3,
+          useDns: false,
+          compression: 'no',
+          maxSessions: 64,
+          maxStartups: '30:50:100',
+        });
+        if (!cfgRes.ok) {
+          mark(1, 'error', cfgRes.message);
+          onNotify('error', cfgRes.message);
+          return;
+        }
+        const restartRes = await window.relayApi.controlSshdService('restart');
+        if (!restartRes.ok) {
+          mark(1, 'error', restartRes.message);
+          onNotify('error', restartRes.message);
+          return;
+        }
+        mark(1, 'done', `TCP ${targetPort} 已生效`);
       } else {
-        mark(2, 'done', '全部已生效');
+        mark(1, 'done', `TCP ${targetPort} 已生效（跳过重启）`);
       }
 
-      // Step 4 (Optional): QUIC / Hysteria 2
+      // Step 3: Crash recovery + Anti-reboot + TCP CUBIC / Anti-sleep (only run missing ones)
+      mark(2, 'active');
+      const pendingTasks: Array<Promise<{ ok: boolean; message: string }>> = [];
+      if (!fresh.service.failureRecoveryConfigured) {
+        pendingTasks.push(window.relayApi.configureSshdFailureRecovery());
+      }
+      if (!fresh.updatePolicy.autoRebootDisabled) {
+        pendingTasks.push(window.relayApi.setDisableAutoReboot(true));
+      }
+      if (!fresh.systemTuning.tuned) {
+        pendingTasks.push(window.relayApi.applyServerSystemTuning());
+      }
+
+      if (pendingTasks.length === 0) {
+        mark(2, 'done', '全部已生效（跳过）');
+      } else {
+        const results = await Promise.all(pendingTasks);
+        const stErrs = results.filter((r) => !r.ok).map((r) => r.message);
+        if (stErrs.length > 0) {
+          mark(2, 'error', stErrs.join(' | '));
+          onNotify('warn', `部分稳定性项未完全生效：${stErrs[0]}`);
+        } else {
+          mark(2, 'done', '全部已生效');
+        }
+      }
+
+      // Step 4 (Optional): QUIC / Hysteria 2 (skip already-running matching engine & existing task)
       if (enableQuic) {
-        mark(3, 'active', '检查/下载内核并启动...');
-        if (!overview?.quicServer.binaryInstalled) {
+        mark(3, 'active', '检查内核、服务与开机自启状态...');
+        if (!fresh.quicServer.binaryInstalled) {
           const dlRes = await window.relayApi.downloadHysteriaBinary('serverB');
           if (!dlRes.ok) {
             mark(3, 'error', '自动下载失败（可到「高级设置」导入本地 hysteria.exe）');
@@ -195,24 +237,42 @@ export const ServerDashboard: React.FC<ServerDashboardProps> = ({
             return;
           }
         }
-        const quicRes = await window.relayApi.deployQuicServer({
-          udpPort: quicUdpPort,
-          sni: overview?.quicServer.sni || 'www.bing.com',
-          maxUpMbps: overview?.quicServer.maxUpMbps || 200,
-          maxDownMbps: overview?.quicServer.maxDownMbps || 200,
-          enableObfs: true,
-        });
-        if (!quicRes.ok) {
-          mark(3, 'error', quicRes.message);
-          onNotify('error', quicRes.message);
-          await onRefresh(false);
-          return;
+
+        const quicAlreadyRunningMatch =
+          fresh.quicServer.running &&
+          fresh.quicServer.configured &&
+          fresh.quicServer.udpPort === quicUdpPort &&
+          Boolean(fresh.quicServer.obfsPassword);
+
+        if (!quicAlreadyRunningMatch) {
+          const quicRes = await window.relayApi.deployQuicServer({
+            udpPort: quicUdpPort,
+            sni: fresh.quicServer.sni || 'www.bing.com',
+            maxUpMbps: fresh.quicServer.maxUpMbps || 200,
+            maxDownMbps: fresh.quicServer.maxDownMbps || 200,
+            enableObfs: true,
+          });
+          if (!quicRes.ok) {
+            mark(3, 'error', quicRes.message);
+            onNotify('error', quicRes.message);
+            await onRefresh(false);
+            return;
+          }
         }
-        await window.relayApi.configureQuicStartupTask();
-        mark(3, 'done', `UDP ${quicUdpPort} 运行中`);
+
+        if (!fresh.quicServer.startupTaskConfigured) {
+          await window.relayApi.configureQuicStartupTask();
+        }
+        mark(
+          3,
+          'done',
+          quicAlreadyRunningMatch && fresh.quicServer.startupTaskConfigured
+            ? `UDP ${quicUdpPort} 已就绪（跳过）`
+            : `UDP ${quicUdpPort} 运行中`
+        );
       }
 
-      onNotify('success', '中转端已一键完成全部部署与跨国弱网优化！现在可直接复制配对码发给设备 A。');
+      onNotify('success', '中转端已按当前状态完成补齐与优化！现在可直接复制配对码发给设备 A。');
       await onRefresh(false);
     } finally {
       setBusy(false);

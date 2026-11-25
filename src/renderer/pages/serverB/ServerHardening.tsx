@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { isPort22FirewallRule } from '../../../shared/commandBuilders';
+import { isFirewallPortAllowed, isPort22FirewallRule } from '../../../shared/commandBuilders';
 import type { ServerOverview } from '../../../shared/types';
 import { IconShield, IconWrench } from '../../components/Icons';
 import { StatusBadge } from '../../components/StatusBadge';
@@ -289,6 +289,9 @@ export const ServerHardening: React.FC<ServerHardeningProps> = ({
 
   const hasEnabledPort22Rule = Boolean(
     overview?.firewallRules.some((r) => r.enabled && isPort22FirewallRule(r))
+  );
+  const customFwPortAllowed = Boolean(
+    overview && isFirewallPortAllowed(overview.firewallRules, 'TCP', customFwPort)
   );
 
   const stabilityAllGood = Boolean(
@@ -685,8 +688,12 @@ export const ServerHardening: React.FC<ServerHardeningProps> = ({
               value={customFwPort}
               onChange={(e) => setCustomFwPort(Number(e.target.value) || 53622)}
             />
-            <button className="btn btn-primary" onClick={handleAllowPort} disabled={busy}>
-              放行 TCP {customFwPort}
+            <button
+              className={`btn ${customFwPortAllowed ? '' : 'btn-primary'}`}
+              onClick={handleAllowPort}
+              disabled={busy || customFwPortAllowed}
+            >
+              {customFwPortAllowed ? `✓ TCP ${customFwPort} 已放行` : `放行 TCP ${customFwPort}`}
             </button>
             <button
               className="btn"

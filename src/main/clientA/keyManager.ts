@@ -223,6 +223,25 @@ export function trustHostKeys(
       .filter((l) => l.trim().length > 0);
   }
 
+  // Check if all requested host keys already exist identically (no-op if unchanged)
+  const allAlreadyPresent = keyLines.every((k) =>
+    existingLines.some((line) => {
+      const parts = line.trim().split(/\s+/);
+      return (
+        parts.length >= 3 &&
+        parts[0].split(',').includes(target) &&
+        parts[1] === k.keyType &&
+        parts[2] === k.keyData
+      );
+    })
+  );
+  if (allAlreadyPresent) {
+    return {
+      ok: true,
+      message: `主机 ${target} 的指纹已在信任列表中，无需重复写入。`,
+    };
+  }
+
   // Remove old entries for the exact target+keyType so port re-installs don't cause conflict
   const newTypes = new Set(keyLines.map((k) => k.keyType));
   const filtered = existingLines.filter((line) => {

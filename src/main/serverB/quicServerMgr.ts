@@ -80,11 +80,33 @@ class QuicServerManager {
 
   private async isStartupTaskConfigured(): Promise<boolean> {
     if (!IS_WINDOWS) return false;
-    const res = await runPowerShell(
-      `if (Get-ScheduledTask -TaskName '${TASK_NAME}' -ErrorAction SilentlyContinue) { 'YES' } else { 'NO' }`,
-      8000
-    );
-    return res.stdout.trim().includes('YES');
+    // Fast native Win32 check (~30ms) — completely immune to PowerShell/CIM concurrency timeouts and OS language
+    const st = await execCmd('schtasks.exe', ['/Query', '/TN', TASK_NAME], { timeoutMs: 6000 });
+    if (st.code === 0) {
+      return true;
+    }
+    // Also check root-prefixed path in case Task Scheduler requires leading backslash
+    const stRoot = await execCmd('schtasks.exe', ['/Query', '/TN', `\\${TASK_NAME}`], { timeoutMs: 6000 });
+    if (stRoot.code === 0) {
+      return true;
+    }
+    // Fallback to PowerShell only if schtasks failed unexpectedly (e.g. non-standard environment)
+    if (!st.stderr && !stRoot.stderr) {
+      const ps = await runPowerShell(
+        `if (Get-ScheduledTask -TaskName '${TASK_NAME}' -ErrorAction SilentlyContinue) { 'YES' } else { 'NO' }`,
+        15000
+      );
+      return ps.stdout.trim().includes('YES');
+    }
+    return false;
+  }
+
+  private async isStartupTaskMatchingTarget(binPath: string, yamlPath: string): Promise<boolean> {
+    if (!IS_WINDOWS) return false;
+    const xmlRes = await execCmd('schtasks.exe', ['/Query', '/TN', TASK_NAME, '/XML'], { timeoutMs: 6000 });
+    if (xmlRes.code !== 0 || !xmlRes.stdout) return false;
+    const lowerXml = xmlRes.stdout.toLowerCase();
+    return lowerXml.includes(binPath.toLowerCase()) && lowerXml.includes(yamlPath.toLowerCase());
   }
 
   private async isExternalServerProcessRunning(): Promise<number | null> {
@@ -92,9 +114,23 @@ class QuicServerManager {
       return this.child.pid;
     }
     if (!IS_WINDOWS) return null;
+    // Fast native pre-check (~25ms): avoid spawning PowerShell/CIM when no hysteria.exe process exists
+    const tl = await execCmd(
+      'tasklist.exe',
+      ['/FI', 'IMAGENAME eq hysteria.exe', '/FO', 'CSV', '/NH'],
+      { timeoutMs: 5000 }
+    );
+    const lines = tl.stdout
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter((l) => l.toLowerCase().startsWith('"hysteria.exe"'));
+    if (lines.length === 0) {
+      return null;
+    }
+    // Verify via CIM that it's running in server mode (not a Client A process on the same machine)
     const res = await runPowerShell(
       `$p = Get-CimInstance Win32_Process -Filter "Name='hysteria.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like '*server*' } | Select-Object -First 1; if ($p) { $p.ProcessId }`,
-      8000
+      12000
     );
     const pid = Number.parseInt(res.stdout.trim(), 10);
     return Number.isInteger(pid) && pid > 0 ? pid : null;
@@ -301,6 +337,16 @@ class QuicServerManager {
     const bin = await inspectHysteriaBinary('serverB', customBinaryPath);
     if (!bin.installed || !fs.existsSync(this.yamlPath)) {
       return { ok: false, message: '请先部署并启动 QUIC 服务端，再配置开机自启任务' };
+    }
+
+    // Fact-first idempotency: if the task already exists and points to the exact same binary + yaml, do not re-register
+    if (await this.isStartupTaskMatchingTarget(bin.path, this.yamlPath)) {
+      logger.info('serverB', `开机自启计划任务 (${TASK_NAME}) 已存在且配置一致，跳过重复注册`);
+      return {
+        ok: true,
+        message: `QUIC 开机自启任务 (${TASK_NAME}) 已生效，无需重复配置`,
+        data: await this.getStatus(customBinaryPath),
+      };
     }
 
     const psScript = `

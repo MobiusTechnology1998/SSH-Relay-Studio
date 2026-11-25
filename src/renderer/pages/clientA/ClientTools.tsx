@@ -413,7 +413,7 @@ export const ClientTools: React.FC<ClientToolsProps> = ({
             }
           />
           <span>
-            推荐：SOCKS5 模式下禁用 QUIC / HTTP3（<code className="mono">--disable-quic</code>，避免访问 Cloudflare/Google/OpenAI 等站点时因 UDP 不可达导致超时回退，无警告横幅）
+            推荐：仅在 <strong>OpenSSH SOCKS5 模式</strong>下禁用浏览器 HTTP/3（<code className="mono">--disable-quic</code>，避免 SSH 纯 TCP 通道访问站点时触发 UDP 回退延迟；使用 Hysteria 2 QUIC 加速时会自动保留浏览器 HTTP/3）
           </span>
         </label>
 
