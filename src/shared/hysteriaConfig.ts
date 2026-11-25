@@ -82,7 +82,10 @@ export function buildHysteriaServerYaml(params: HysteriaServerYamlParams): strin
  * - Strict TLS SHA-256 certificate pinning (pinSHA256) against Device B's self-signed cert
  * - Native SOCKS5 (TCP + UDP ASSOCIATE) or HTTP listener on 127.0.0.1:<localPort>
  */
-export function buildHysteriaClientYaml(node: NodeProfile): string {
+export function buildHysteriaClientYaml(
+  node: NodeProfile,
+  listenPortOverride?: number
+): string {
   const host = node.host.trim();
   const udpPort = node.quicUdpPort ?? 53623;
   const auth = (node.quicAuthToken || '').trim();
@@ -91,6 +94,7 @@ export function buildHysteriaClientYaml(node: NodeProfile): string {
   const obfs = (node.quicObfsPassword || '').trim();
   const upMbps = Math.max(5, Math.min(2000, Math.round(node.quicUpMbps ?? 50)));
   const downMbps = Math.max(10, Math.min(5000, Math.round(node.quicDownMbps ?? 200)));
+  const listenPort = listenPortOverride ?? node.localPort;
 
   if (!host) {
     throw new Error('节点主机地址不能为空');
@@ -149,9 +153,9 @@ export function buildHysteriaClientYaml(node: NodeProfile): string {
   );
 
   if (node.mode === 'localForward') {
-    lines.push('http:', `  listen: 127.0.0.1:${node.localPort}`, '');
+    lines.push('http:', `  listen: 127.0.0.1:${listenPort}`, '');
   } else {
-    lines.push('socks5:', `  listen: 127.0.0.1:${node.localPort}`, '');
+    lines.push('socks5:', `  listen: 127.0.0.1:${listenPort}`, '');
   }
 
   return lines.join('\n');

@@ -2,6 +2,7 @@ import net from 'net';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   probeLocalForwardHealth,
+  probeQuicTunnelHealth,
   probeSocks5TunnelHealth,
 } from '../src/main/clientA/healthProbe';
 
@@ -112,5 +113,32 @@ describe('healthProbe', () => {
 
     const res = await probeLocalForwardHealth(port, 2000);
     expect(res.ok).toBe(true);
+  });
+
+  it('measures genuine end-to-end RTT through fastOpen QUIC SOCKS5 instead of 0ms local CONNECT reply', async () => {
+    const port = await startMockServer((socket) => {
+      let step = 0;
+      socket.on('data', (chunk) => {
+        if (step === 0) {
+          step = 1;
+          socket.write(Buffer.from([0x05, 0x00]));
+        } else if (step === 1) {
+          step = 2;
+          // Simulate Hysteria 2 fastOpen: immediate 0ms local CONNECT success reply
+          socket.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
+        } else if (step === 2 && chunk.toString('ascii').includes('SSH-2.0-')) {
+          step = 3;
+          // Simulate cross-border QUIC round-trip to Device B sshd banner (~45ms)
+          setTimeout(() => {
+            socket.write('SSH-2.0-OpenSSH_for_Windows_9.5\r\n');
+          }, 45);
+        }
+      });
+    });
+
+    const res = await probeQuicTunnelHealth('socks5', port, 53622, 2000);
+    expect(res.ok).toBe(true);
+    expect(res.latencyMs).not.toBeNull();
+    expect(res.latencyMs!).toBeGreaterThanOrEqual(35);
   });
 });

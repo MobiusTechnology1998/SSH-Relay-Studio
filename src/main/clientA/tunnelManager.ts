@@ -74,6 +74,11 @@ class TunnelManager {
   private rotationCursor = 0;
   private listeners = new Set<StatusListener>();
   private lastMetricsFingerprint = '';
+  private prevBytesUp = 0;
+  private prevBytesDown = 0;
+  private prevMetricsAt = 0;
+  private currentSpeedUpBps = 0;
+  private currentSpeedDownBps = 0;
 
   private status: TunnelStatus = {
     state: 'disconnected',
@@ -94,6 +99,8 @@ class TunnelManager {
     activeConnections: 0,
     totalBytesUp: 0,
     totalBytesDown: 0,
+    speedUpBps: 0,
+    speedDownBps: 0,
     workers: [],
     lastError: null,
     diagnosticHint: null,
@@ -296,6 +303,8 @@ class TunnelManager {
       activeConnections: stats.activeConnections,
       totalBytesUp: stats.totalBytesUp,
       totalBytesDown: stats.totalBytesDown,
+      speedUpBps: this.currentSpeedUpBps,
+      speedDownBps: this.currentSpeedDownBps,
       workers: workerList,
       ...(nextState === 'connected' ? { lastError: null, diagnosticHint: null } : {}),
       ...extra,
@@ -402,6 +411,11 @@ class TunnelManager {
     this.activeNode = { ...node };
     this.rotationCursor = 0;
     this.lastMetricsFingerprint = '';
+    this.prevBytesUp = 0;
+    this.prevBytesDown = 0;
+    this.prevMetricsAt = Date.now();
+    this.currentSpeedUpBps = 0;
+    this.currentSpeedDownBps = 0;
 
     this.emit({
       state: 'connecting',
@@ -422,6 +436,8 @@ class TunnelManager {
       activeConnections: 0,
       totalBytesUp: 0,
       totalBytesDown: 0,
+      speedUpBps: 0,
+      speedDownBps: 0,
       workers: [],
       runningConfigHash: configHash,
       lastError: null,
@@ -442,16 +458,24 @@ class TunnelManager {
       this.staggerTimers.push(timer);
     }
 
-    // Periodically push active connection & throughput telemetry to UI
+    // Periodically push active connection, live speed (B/s) & throughput telemetry to UI
     this.metricsTimer = setInterval(() => {
       if (!this.desiredRunning || epoch !== this.sessionEpoch) return;
+      const now = Date.now();
+      const elapsedSec = Math.max(0.25, (now - this.prevMetricsAt) / 1000);
       const stats = this.balancer.getStats();
-      const fp = `${stats.activeConnections}:${stats.totalBytesUp}:${stats.totalBytesDown}`;
+      this.currentSpeedUpBps = Math.max(0, Math.round((stats.totalBytesUp - this.prevBytesUp) / elapsedSec));
+      this.currentSpeedDownBps = Math.max(0, Math.round((stats.totalBytesDown - this.prevBytesDown) / elapsedSec));
+      this.prevBytesUp = stats.totalBytesUp;
+      this.prevBytesDown = stats.totalBytesDown;
+      this.prevMetricsAt = now;
+
+      const fp = `${stats.activeConnections}:${stats.totalBytesUp}:${stats.totalBytesDown}:${this.currentSpeedUpBps}:${this.currentSpeedDownBps}`;
       if (fp !== this.lastMetricsFingerprint) {
         this.lastMetricsFingerprint = fp;
         this.syncAggregateStatus();
       }
-    }, 1500);
+    }, 1000);
 
     // Optional periodic Make-Before-Break smooth worker rotation
     const rotMin =
@@ -1081,6 +1105,8 @@ class TunnelManager {
       activeConnections: 0,
       totalBytesUp: 0,
       totalBytesDown: 0,
+      speedUpBps: 0,
+      speedDownBps: 0,
       workers: [],
       runningConfigHash: null,
       lastError: null,

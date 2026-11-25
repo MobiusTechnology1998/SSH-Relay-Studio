@@ -14,7 +14,8 @@ import type { NodeProfile, TunnelStatus } from '../../shared/types';
 import { logger } from '../logger';
 import { inspectHysteriaBinary } from '../platform/binaryMgr';
 import { execCmd, isLocalPortListening, IS_WINDOWS } from '../platform/shell';
-import { probeTunnelHealth } from './healthProbe';
+import { probeQuicTunnelHealth } from './healthProbe';
+import { findFreeLocalPort, LocalProxyBalancer } from './localProxyBalancer';
 
 export interface QuicEngineCallbacks {
   onStatusUpdate: (patch: Partial<TunnelStatus>) => void;
@@ -28,13 +29,18 @@ const HEALTH_FAIL_THRESHOLD = 2;
 /**
  * Manages the Hysteria 2 QUIC client process on Device A for cross-border weak networks:
  * - Zero TCP-over-TCP head-of-line blocking + Brutal congestion control + native UDP
- * - Active SOCKS5/HTTP liveness probing + OS wake recovery
+ * - Dedicated local L4 proxy front-end for real-time speed (B/s), cumulative traffic, and active stream counting
+ * - Genuine end-to-end A<->B RTT probing (working accurately even with fastOpen: true) + OS wake recovery
  * - Automatic seamless fallback to OpenSSH Multi-Tunnel Pool when UDP is blocked
  */
 export class QuicTunnelEngine {
   private child: ChildProcess | null = null;
+  private balancer = new LocalProxyBalancer();
+  private internalPort: number | null = null;
   private pollTimer: NodeJS.Timeout | null = null;
   private healthTimer: NodeJS.Timeout | null = null;
+  private initialProbeTimer: NodeJS.Timeout | null = null;
+  private metricsTimer: NodeJS.Timeout | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private resumeTimer: NodeJS.Timeout | null = null;
   private desiredRunning = false;
@@ -45,6 +51,11 @@ export class QuicTunnelEngine {
   private consecutiveHealthFailures = 0;
   private reconnectCount = 0;
   private healthInFlight = false;
+  private lastLatencyMs: number | null = null;
+  private prevBytesUp = 0;
+  private prevBytesDown = 0;
+  private prevMetricsAt = 0;
+  private lastMetricsFp = '';
   private lastOutput = '';
   private callbacks: QuicEngineCallbacks;
 
@@ -64,6 +75,14 @@ export class QuicTunnelEngine {
     if (this.healthTimer) {
       clearInterval(this.healthTimer);
       this.healthTimer = null;
+    }
+    if (this.initialProbeTimer) {
+      clearTimeout(this.initialProbeTimer);
+      this.initialProbeTimer = null;
+    }
+    if (this.metricsTimer) {
+      clearInterval(this.metricsTimer);
+      this.metricsTimer = null;
     }
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
@@ -98,7 +117,7 @@ export class QuicTunnelEngine {
 
     const bin = await inspectHysteriaBinary('clientA', customBinaryPath);
     if (!bin.installed) {
-      const msg = '未检测到 Hysteria 2 客户端内核，请先在「代理浏览器与工具」中一键下载或导入本地 hysteria.exe。';
+      const msg = '未检测到 Hysteria 2 客户端内核，请先在首页或「代理浏览器与工具」中一键下载或导入本地 hysteria.exe。';
       if (node.autoFallbackToSsh !== false) {
         logger.warn('tunnel', `${msg} 正在自动回退至 OpenSSH 多隧道连接池...`);
         this.callbacks.onFallbackToSsh('本机尚未安装 Hysteria 2 内核');
@@ -107,9 +126,16 @@ export class QuicTunnelEngine {
       return { ok: false, message: msg };
     }
 
+    let internalPort: number;
+    try {
+      internalPort = await findFreeLocalPort();
+    } catch (err) {
+      return { ok: false, message: `无法分配 QUIC 本地内部端口: ${(err as Error).message}` };
+    }
+
     let yaml: string;
     try {
-      yaml = buildHysteriaClientYaml(node);
+      yaml = buildHysteriaClientYaml(node, internalPort);
     } catch (err) {
       const msg = (err as Error).message;
       if (node.autoFallbackToSsh !== false) {
@@ -120,15 +146,30 @@ export class QuicTunnelEngine {
       return { ok: false, message: msg };
     }
 
+    try {
+      await this.balancer.start(node.localPort);
+    } catch (err) {
+      return {
+        ok: false,
+        message: `无法监听本地代理端口 127.0.0.1:${node.localPort}: ${(err as Error).message}`,
+      };
+    }
+
     fs.mkdirSync(path.dirname(this.configPath), { recursive: true });
     fs.writeFileSync(this.configPath, yaml, 'utf8');
 
     this.desiredRunning = true;
     this.activeNode = { ...node };
+    this.internalPort = internalPort;
     this.customBinaryPath = customBinaryPath || '';
     this.consecutiveStartupFailures = 0;
     this.consecutiveHealthFailures = 0;
     this.reconnectCount = 0;
+    this.lastLatencyMs = null;
+    this.prevBytesUp = 0;
+    this.prevBytesDown = 0;
+    this.prevMetricsAt = Date.now();
+    this.lastMetricsFp = '';
     const epoch = ++this.sessionEpoch;
 
     this.callbacks.onStatusUpdate({
@@ -150,6 +191,8 @@ export class QuicTunnelEngine {
       activeConnections: 0,
       totalBytesUp: 0,
       totalBytesDown: 0,
+      speedUpBps: 0,
+      speedDownBps: 0,
       workers: [],
       lastError: null,
       diagnosticHint: null,
@@ -162,11 +205,61 @@ export class QuicTunnelEngine {
     };
   }
 
+  private startMetricsLoop(child: ChildProcess, epoch: number): void {
+    if (this.metricsTimer) {
+      clearInterval(this.metricsTimer);
+      this.metricsTimer = null;
+    }
+    this.prevMetricsAt = Date.now();
+    const initialStats = this.balancer.getStats();
+    this.prevBytesUp = initialStats.totalBytesUp;
+    this.prevBytesDown = initialStats.totalBytesDown;
+
+    this.metricsTimer = setInterval(() => {
+      if (!this.desiredRunning || epoch !== this.sessionEpoch || this.child !== child) return;
+      const now = Date.now();
+      const elapsedSec = Math.max(0.25, (now - this.prevMetricsAt) / 1000);
+      const stats = this.balancer.getStats();
+      const speedUpBps = Math.max(0, Math.round((stats.totalBytesUp - this.prevBytesUp) / elapsedSec));
+      const speedDownBps = Math.max(0, Math.round((stats.totalBytesDown - this.prevBytesDown) / elapsedSec));
+
+      this.prevBytesUp = stats.totalBytesUp;
+      this.prevBytesDown = stats.totalBytesDown;
+      this.prevMetricsAt = now;
+
+      const fp = `${stats.activeConnections}:${stats.totalBytesUp}:${stats.totalBytesDown}:${speedUpBps}:${speedDownBps}`;
+      if (fp !== this.lastMetricsFp) {
+        this.lastMetricsFp = fp;
+        this.callbacks.onStatusUpdate({
+          activeConnections: stats.activeConnections,
+          totalBytesUp: stats.totalBytesUp,
+          totalBytesDown: stats.totalBytesDown,
+          speedUpBps,
+          speedDownBps,
+          workers: [
+            {
+              id: 'quic-primary',
+              slotIndex: 0,
+              internalPort: this.internalPort ?? this.activeNode?.localPort ?? 1080,
+              pid: child.pid ?? null,
+              state: 'healthy',
+              latencyMs: this.lastLatencyMs,
+              activeConnections: stats.activeConnections,
+              reconnectCount: this.reconnectCount,
+            },
+          ],
+        });
+      }
+    }, 1000);
+  }
+
   private spawnClient(binPath: string, epoch: number, isReconnect: boolean): void {
     const node = this.activeNode;
-    if (!node || !this.desiredRunning || epoch !== this.sessionEpoch) return;
+    const internalPort = this.internalPort;
+    if (!node || !internalPort || !this.desiredRunning || epoch !== this.sessionEpoch) return;
 
     this.clearTimers();
+    this.balancer.removeBackend('quic-primary');
     this.lastOutput = '';
     let connectedLogged = false;
 
@@ -183,7 +276,7 @@ export class QuicTunnelEngine {
       });
     } catch (err) {
       const msg = `无法启动 Hysteria 2 进程: ${(err as Error).message}`;
-      this.handleFailure(epoch, msg);
+      void this.handleFailure(epoch, msg);
       return;
     }
 
@@ -224,7 +317,7 @@ export class QuicTunnelEngine {
         return;
       }
 
-      const listening = await isLocalPortListening(node.localPort);
+      const listening = await isLocalPortListening(internalPort);
       if (!this.desiredRunning || epoch !== this.sessionEpoch || this.child !== child) return;
 
       if (listening && (connectedLogged || Date.now() - startedAt >= 1500)) {
@@ -235,9 +328,16 @@ export class QuicTunnelEngine {
         this.consecutiveStartupFailures = 0;
         this.consecutiveHealthFailures = 0;
 
+        this.balancer.upsertBackend({
+          id: 'quic-primary',
+          port: internalPort,
+          healthy: true,
+          latencyMs: this.lastLatencyMs,
+        });
+
         logger.success(
           'tunnel',
-          `QUIC (Hysteria 2) 加速隧道已就绪！本地监听 127.0.0.1:${node.localPort} (原生支持 TCP+UDP)`
+          `QUIC (Hysteria 2) 加速隧道已就绪！本地监听 127.0.0.1:${node.localPort} (实时测速与延迟监控已开启)`
         );
         this.callbacks.onStatusUpdate({
           state: 'connected',
@@ -254,17 +354,18 @@ export class QuicTunnelEngine {
             {
               id: 'quic-primary',
               slotIndex: 0,
-              internalPort: node.localPort,
+              internalPort,
               pid: child.pid ?? null,
               state: 'healthy',
-              latencyMs: null,
+              latencyMs: this.lastLatencyMs,
               activeConnections: 0,
               reconnectCount: this.reconnectCount,
             },
           ],
         });
 
-        this.startHealthLoop(child, node, epoch);
+        this.startMetricsLoop(child, epoch);
+        this.startHealthLoop(child, node, internalPort, epoch);
       } else if (Date.now() - startedAt > QUIC_STARTUP_TIMEOUT_MS) {
         if (this.pollTimer) {
           clearInterval(this.pollTimer);
@@ -278,24 +379,30 @@ export class QuicTunnelEngine {
 
     child.once('error', (err) => {
       if (this.child !== child || epoch !== this.sessionEpoch) return;
-      this.handleFailure(epoch, err.message);
+      void this.handleFailure(epoch, err.message);
     });
 
     child.once('exit', (code) => {
       if (this.child !== child) return;
       this.child = null;
       this.clearTimers();
+      this.balancer.removeBackend('quic-primary');
 
       if (!this.desiredRunning || epoch !== this.sessionEpoch) {
         return;
       }
 
       const reason = this.lastOutput || `Hysteria 2 客户端退出 (code=${code ?? 'null'})`;
-      this.handleFailure(epoch, reason);
+      void this.handleFailure(epoch, reason);
     });
   }
 
-  private startHealthLoop(child: ChildProcess, node: NodeProfile, epoch: number): void {
+  private startHealthLoop(
+    child: ChildProcess,
+    node: NodeProfile,
+    internalPort: number,
+    epoch: number
+  ): void {
     if (node.healthCheckEnabled === false) return;
     const intervalSec =
       typeof node.healthCheckIntervalSec === 'number' &&
@@ -310,10 +417,10 @@ export class QuicTunnelEngine {
       }
       this.healthInFlight = true;
       try {
-        // Probe local proxy listening + lightweight E2E tunnel check
-        const res = await probeTunnelHealth(
+        // Measure genuine A<->B QUIC RTT even with fastOpen: true
+        const res = await probeQuicTunnelHealth(
           node.mode,
-          node.localPort,
+          internalPort,
           node.sshPort,
           HEALTH_PROBE_TIMEOUT_MS
         );
@@ -321,6 +428,14 @@ export class QuicTunnelEngine {
 
         if (res.ok) {
           this.consecutiveHealthFailures = 0;
+          this.lastLatencyMs = res.latencyMs;
+          this.balancer.upsertBackend({
+            id: 'quic-primary',
+            port: internalPort,
+            healthy: true,
+            latencyMs: res.latencyMs,
+          });
+          const stats = this.balancer.getStats();
           this.callbacks.onStatusUpdate({
             lastHealthCheckAt: Date.now(),
             lastHealthLatencyMs: res.latencyMs,
@@ -328,21 +443,18 @@ export class QuicTunnelEngine {
               {
                 id: 'quic-primary',
                 slotIndex: 0,
-                internalPort: node.localPort,
+                internalPort,
                 pid: child.pid ?? null,
                 state: 'healthy',
                 latencyMs: res.latencyMs,
-                activeConnections: 0,
+                activeConnections: stats.activeConnections,
                 reconnectCount: this.reconnectCount,
               },
             ],
           });
         } else {
-          // If loopback is blocked by Hysteria ACL, verify local port is at least alive before killing
-          const stillListening = await isLocalPortListening(node.localPort);
-          if (!stillListening) {
-            this.consecutiveHealthFailures += 1;
-          } else if (res.detail.includes('超时')) {
+          const stillListening = await isLocalPortListening(internalPort);
+          if (!stillListening || res.detail.includes('超时')) {
             this.consecutiveHealthFailures += 1;
           }
 
@@ -357,16 +469,18 @@ export class QuicTunnelEngine {
       }
     };
 
-    setTimeout(() => {
+    // Run initial RTT measurement promptly (500ms) so UI shows real latency immediately
+    this.initialProbeTimer = setTimeout(() => {
+      this.initialProbeTimer = null;
       void runProbe();
-    }, 3000);
+    }, 500);
 
     this.healthTimer = setInterval(() => {
       void runProbe();
     }, intervalSec * 1000);
   }
 
-  private handleFailure(epoch: number, reason: string): void {
+  private async handleFailure(epoch: number, reason: string): Promise<void> {
     const node = this.activeNode;
     if (!node || !this.desiredRunning || epoch !== this.sessionEpoch) return;
 
@@ -383,6 +497,7 @@ export class QuicTunnelEngine {
       this.desiredRunning = false;
       this.sessionEpoch += 1;
       this.clearTimers();
+      await this.balancer.stop();
       this.callbacks.onFallbackToSsh(reason);
       return;
     }
@@ -398,6 +513,8 @@ export class QuicTunnelEngine {
       pid: null,
       connectedSince: null,
       healthyWorkers: 0,
+      speedUpBps: 0,
+      speedDownBps: 0,
       reconnectCount: this.reconnectCount,
       nextRetryAt: Date.now() + delayMs,
       lastError: reason,
@@ -410,6 +527,7 @@ export class QuicTunnelEngine {
       if (!this.desiredRunning || epoch !== this.sessionEpoch) return;
       const bin = await inspectHysteriaBinary('clientA', this.customBinaryPath);
       if (!bin.installed) {
+        await this.balancer.stop();
         this.callbacks.onFallbackToSsh('Hysteria 2 二进制缺失');
         return;
       }
@@ -445,6 +563,9 @@ export class QuicTunnelEngine {
     this.clearTimers();
     const child = this.child;
     this.child = null;
+    this.internalPort = null;
+    this.lastLatencyMs = null;
     await this.killChild(child);
+    await this.balancer.stop();
   }
 }

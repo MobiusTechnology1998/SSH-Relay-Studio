@@ -52,6 +52,8 @@ const DEFAULT_TUNNEL_STATUS: TunnelStatus = {
   activeConnections: 0,
   totalBytesUp: 0,
   totalBytesDown: 0,
+  speedUpBps: 0,
+  speedDownBps: 0,
   workers: [],
   lastError: null,
   diagnosticHint: null,

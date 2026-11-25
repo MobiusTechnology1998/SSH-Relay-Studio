@@ -57,6 +57,11 @@ function formatBytes(bytes: number): string {
   return `${val >= 100 || idx === 0 ? val.toFixed(0) : val.toFixed(1)} ${units[idx]}`;
 }
 
+function formatSpeed(bps: number): string {
+  if (!bps || bps <= 0) return '0 B/s';
+  return `${formatBytes(bps)}/s`;
+}
+
 export const ClientDashboard: React.FC<ClientDashboardProps> = ({
   envInfo,
   settings,
@@ -515,22 +520,43 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
           {/* Live Metrics */}
           <div className="grid-4">
             <div className="metric-tile">
+              <div className="metric-label">实时速率</div>
+              <div className="metric-value" style={{ fontSize: 15 }}>
+                ↓ {formatSpeed(tunnelStatus.speedDownBps)} · ↑ {formatSpeed(tunnelStatus.speedUpBps)}
+              </div>
+              <div className="metric-sub">
+                累计 ↓ {formatBytes(tunnelStatus.totalBytesDown)} · ↑{' '}
+                {formatBytes(tunnelStatus.totalBytesUp)}
+              </div>
+            </div>
+            <div className="metric-tile">
+              <div className="metric-label">端到端延迟 (RTT)</div>
+              <div className="metric-value">
+                {tunnelStatus.lastHealthLatencyMs !== null
+                  ? `${tunnelStatus.lastHealthLatencyMs} ms`
+                  : '--'}
+              </div>
+              <div className="metric-sub">
+                {tunnelStatus.activeEngine === 'hysteria2' && !tunnelStatus.fallbackActive
+                  ? `QUIC 主动探活 ${activeNode?.healthCheckIntervalSec ?? 25}s`
+                  : `心跳 ${aliveInterval}s × ${aliveCountMax} · 探活 ${activeNode?.healthCheckIntervalSec ?? 25}s`}
+              </div>
+            </div>
+            <div className="metric-tile">
               <div className="metric-label">
                 {tunnelStatus.activeEngine === 'hysteria2' && !tunnelStatus.fallbackActive
-                  ? 'QUIC 加速通道'
-                  : '通道状态 / 活跃流'}
+                  ? 'QUIC 加速通道 / 活跃流'
+                  : '并行连接池 / 活跃流'}
               </div>
               <div className="metric-value">
                 {tunnelStatus.activeEngine === 'hysteria2' && !tunnelStatus.fallbackActive
-                  ? tunnelStatus.state === 'connected'
-                    ? 'QUIC 原生多路复用'
-                    : '未连接'
+                  ? `${tunnelStatus.state === 'connected' ? '在线' : '未连'} · ${tunnelStatus.activeConnections} 连接`
                   : `${tunnelStatus.healthyWorkers}/${tunnelStatus.poolSize} · ${tunnelStatus.activeConnections} 连接`}
               </div>
               <div className="metric-sub">
                 127.0.0.1:{activeNode?.localPort ?? 1080} (
                 {tunnelStatus.activeEngine === 'hysteria2' && !tunnelStatus.fallbackActive
-                  ? 'SOCKS5 + 原生 UDP'
+                  ? 'QUIC Brutal'
                   : activeNode?.mode === 'localForward'
                   ? `转发 :${activeNode.remoteProxyPort}`
                   : 'SOCKS5 调度'}
@@ -543,43 +569,21 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
                 {formatDuration(tunnelStatus.connectedSince, now)}
               </div>
               <div className="metric-sub">
-                {tunnelStatus.activeEngine === 'hysteria2' && !tunnelStatus.fallbackActive
-                  ? `主动探活 ${activeNode?.healthCheckIntervalSec ?? 25}s · 重连 ${tunnelStatus.reconnectCount} 次`
-                  : `心跳：${aliveInterval}s × ${aliveCountMax} · 重连 ${tunnelStatus.reconnectCount} 次`}
-              </div>
-            </div>
-            <div className="metric-tile">
-              <div className="metric-label">最优通道延迟</div>
-              <div className="metric-value">
-                {tunnelStatus.lastHealthLatencyMs !== null
-                  ? `${tunnelStatus.lastHealthLatencyMs} ms`
-                  : '--'}
-              </div>
-              <div className="metric-sub">
-                {tunnelStatus.activeEngine === 'hysteria2' && !tunnelStatus.fallbackActive
-                  ? 'UDP QUIC Brutal 拥塞控制'
-                  : `上行 ${formatBytes(tunnelStatus.totalBytesUp)} · 下行 ${formatBytes(tunnelStatus.totalBytesDown)}`}
-              </div>
-            </div>
-            <div className="metric-tile">
-              <div className="metric-label">隔离浏览器</div>
-              <div className="metric-value">
+                重连 {tunnelStatus.reconnectCount} 次 ·{' '}
                 {settings.browser.selectedBrowser === 'edge'
                   ? 'Edge'
                   : settings.browser.selectedBrowser === 'chrome'
                   ? 'Chrome'
                   : '自定义'}
-              </div>
-              <div className="metric-sub">
                 {activeNode?.engine === 'hysteria2' && !tunnelStatus.fallbackActive
-                  ? '已保留浏览器 HTTP/3（QUIC 原生支持）'
+                  ? ' (保留 HTTP/3)'
                   : shouldDisableBrowserHttp3(
                       activeNode,
                       settings.browser,
                       tunnelStatus.fallbackActive
                     )
-                  ? '已禁浏览器 HTTP/3（防 SSH-TCP 延迟）'
-                  : '独立用户目录，全站代理'}
+                  ? ' (禁 HTTP/3)'
+                  : ''}
               </div>
             </div>
           </div>
