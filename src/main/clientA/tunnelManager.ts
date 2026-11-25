@@ -386,6 +386,7 @@ class TunnelManager {
     const configHash = computeNodeConfigHash(node);
 
     try {
+      this.balancer.setMixedHttpBridge(node.mode === 'socks5');
       await this.balancer.start(node.localPort);
     } catch (err) {
       const msg = `本地代理调度器无法监听 127.0.0.1:${node.localPort}: ${(err as Error).message}`;

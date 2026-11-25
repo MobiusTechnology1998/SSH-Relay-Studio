@@ -7,12 +7,14 @@ import type {
   BinaryStatusInfo,
   BrowserPrefs,
   DetectedBrowser,
+  DetectedDesktopApp,
   DiagnosticsResult,
   EnvironmentInfo,
   HostKeyScanResult,
   KeyPairInfo,
   LogEntry,
   NodeProfile,
+  ProxiedAppProfile,
   QuicServerConfigInput,
   QuicServerStatus,
   SecurityCheckResult,
@@ -62,11 +64,16 @@ export interface RelayApi {
   ) => Promise<ActionResult>;
   runSecurityVerification: (node: NodeProfile) => Promise<SecurityCheckResult>;
 
-  // Client A: Browser, Diagnostics, Engines & AutoStart
+  // Client A: Browser, Per-App Launcher, Diagnostics, Engines & AutoStart
   detectBrowsers: () => Promise<DetectedBrowser[]>;
   launchProxyBrowser: (
     node: Pick<NodeProfile, 'mode' | 'localPort' | 'engine'>,
     prefs: BrowserPrefs
+  ) => Promise<ActionResult>;
+  detectDesktopApps: () => Promise<DetectedDesktopApp[]>;
+  launchProxiedApp: (
+    appProfile: ProxiedAppProfile,
+    node: Pick<NodeProfile, 'mode' | 'localPort' | 'engine'>
   ) => Promise<ActionResult>;
   runDiagnostics: (
     node: Pick<NodeProfile, 'mode' | 'localPort'>,
@@ -139,6 +146,9 @@ const api: RelayApi = {
 
   detectBrowsers: () => ipcRenderer.invoke('clientA:detectBrowsers'),
   launchProxyBrowser: (node, prefs) => ipcRenderer.invoke('clientA:launchProxyBrowser', node, prefs),
+  detectDesktopApps: () => ipcRenderer.invoke('clientA:detectDesktopApps'),
+  launchProxiedApp: (appProfile, node) =>
+    ipcRenderer.invoke('clientA:launchProxiedApp', appProfile, node),
   runDiagnostics: (node, targetUrl) => ipcRenderer.invoke('clientA:runDiagnostics', node, targetUrl),
   setAutoStart: (enabled) => ipcRenderer.invoke('clientA:setAutoStart', enabled),
   downloadHysteriaBinary: (scope, customUrl) =>

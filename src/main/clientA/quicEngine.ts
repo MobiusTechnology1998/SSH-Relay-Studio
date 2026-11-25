@@ -147,6 +147,7 @@ export class QuicTunnelEngine {
     }
 
     try {
+      this.balancer.setMixedHttpBridge(node.mode === 'socks5');
       await this.balancer.start(node.localPort);
     } catch (err) {
       return {

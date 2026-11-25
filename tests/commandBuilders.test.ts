@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   buildBrowserLaunchArgs,
+  buildProxiedAppLaunchSpec,
   buildSshTunnelArgs,
   buildTerminalProxySnippets,
   computeNodeConfigHash,
@@ -10,10 +11,12 @@ import {
   formatKnownHostsTarget,
   isFirewallPortAllowed,
   isHardSshAuthFailure,
+  isLikelyChromiumOrElectronApp,
   isNonFatalChannelOpenError,
   isPort22FirewallRule,
   parseRegQueryDwords,
   shouldDisableBrowserHttp3,
+  splitCommandArgs,
   upsertNodeFromPairing,
 } from '../src/shared/commandBuilders';
 import { parseScQfailureOutput } from '../src/main/serverB/opensshService';
@@ -335,5 +338,59 @@ describe('commandBuilders', () => {
       AUOptions: 2,
       NoAutoRebootWithLoggedOnUsers: 1,
     });
+  });
+
+  it('parses quoted CLI arguments cleanly', () => {
+    expect(splitCommandArgs('--new-window "C:\\My Projects\\app" --flag=\'abc def\'')).toEqual([
+      '--new-window',
+      'C:\\My Projects\\app',
+      '--flag=abc def',
+    ]);
+  });
+
+  it('builds process-scoped proxy env and Chromium flags for Electron/CLI apps', () => {
+    expect(isLikelyChromiumOrElectronApp('C:\\Users\\a\\Programs\\cursor\\Cursor.exe')).toBe(true);
+    expect(isLikelyChromiumOrElectronApp('C:\\Windows\\System32\\powershell.exe')).toBe(false);
+    expect(isLikelyChromiumOrElectronApp('C:\\Custom\\MyApp.exe', true)).toBe(true);
+
+    const quicNode: NodeProfile = { ...BASE_NODE, engine: 'hysteria2', localPort: 1080 };
+    const electronSpec = buildProxiedAppLaunchSpec(
+      {
+        exePath: 'C:\\Users\\a\\Programs\\cursor\\Cursor.exe',
+        args: '--new-window',
+        launchMode: 'auto',
+        isolatedProfile: true,
+      },
+      quicNode,
+      { isolatedProfileDir: 'C:\\Profiles\\cursor' }
+    );
+    expect(electronSpec.effectiveMode).toBe('chromiumArgs');
+    expect(electronSpec.envPatch.HTTP_PROXY).toBe('http://127.0.0.1:1080');
+    expect(electronSpec.envPatch.ALL_PROXY).toBe('socks5h://127.0.0.1:1080');
+    expect(electronSpec.args).toContain('--proxy-server=http://127.0.0.1:1080');
+    expect(electronSpec.args).toContain('--user-data-dir=C:\\Profiles\\cursor');
+    expect(electronSpec.args).toContain('--new-window');
+    expect(electronSpec.args).not.toContain('--disable-quic');
+
+    const sshElectronSpec = buildProxiedAppLaunchSpec(
+      {
+        exePath: 'C:\\Users\\a\\Programs\\cursor\\Cursor.exe',
+        launchMode: 'auto',
+      },
+      BASE_NODE
+    );
+    expect(sshElectronSpec.args).toContain('--disable-quic');
+
+    const terminalSpec = buildProxiedAppLaunchSpec(
+      {
+        exePath: 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
+        args: '-NoExit',
+        launchMode: 'auto',
+      },
+      quicNode
+    );
+    expect(terminalSpec.effectiveMode).toBe('envOnly');
+    expect(terminalSpec.args).toEqual(['-NoExit']);
+    expect(terminalSpec.envPatch.HTTPS_PROXY).toBe('http://127.0.0.1:1080');
   });
 });

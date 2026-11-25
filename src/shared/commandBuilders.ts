@@ -3,6 +3,7 @@ import type {
   FirewallRuleInfo,
   NodeProfile,
   PairingPayload,
+  ProxiedAppProfile,
 } from './types';
 
 /**
@@ -525,4 +526,147 @@ export function parseRegQueryDwords(stdout: string): Record<string, number> {
     }
   }
   return result;
+}
+
+const KNOWN_CHROMIUM_ELECTRON_EXES = new Set([
+  'chrome.exe',
+  'msedge.exe',
+  'brave.exe',
+  'vivaldi.exe',
+  'opera.exe',
+  'cursor.exe',
+  'code.exe',
+  'code - insiders.exe',
+  'windsurf.exe',
+  'antigravity.exe',
+  'claude.exe',
+  'chatgpt.exe',
+  'discord.exe',
+  'slack.exe',
+  'notion.exe',
+  'obsidian.exe',
+  'postman.exe',
+  'figma.exe',
+  'feishu.exe',
+  'lark.exe',
+  'spotify.exe',
+]);
+
+/**
+ * Determines whether an executable is a Chromium or Electron desktop app
+ * that benefits from `--proxy-server` CLI flags in addition to proxy env vars.
+ */
+export function isLikelyChromiumOrElectronApp(
+  exePath: string,
+  hasElectronSiblingFiles = false
+): boolean {
+  if (hasElectronSiblingFiles) return true;
+  const normalized = exePath.trim().replace(/\\/g, '/');
+  const base = (normalized.split('/').pop() || '').toLowerCase();
+  return KNOWN_CHROMIUM_ELECTRON_EXES.has(base);
+}
+
+/**
+ * Splits a raw CLI argument string into an argv array, supporting double and single quotes.
+ */
+export function splitCommandArgs(rawArgs?: string): string[] {
+  if (!rawArgs || !rawArgs.trim()) return [];
+  const args: string[] = [];
+  let current = '';
+  let quote: '"' | "'" | null = null;
+  let hasToken = false;
+
+  for (let i = 0; i < rawArgs.length; i += 1) {
+    const ch = rawArgs[i];
+    if (quote) {
+      if (ch === quote) {
+        quote = null;
+      } else {
+        current += ch;
+      }
+      hasToken = true;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+      hasToken = true;
+    } else if (/\s/.test(ch)) {
+      if (hasToken) {
+        args.push(current);
+        current = '';
+        hasToken = false;
+      }
+    } else {
+      current += ch;
+      hasToken = true;
+    }
+  }
+  if (hasToken) {
+    args.push(current);
+  }
+  return args;
+}
+
+export interface ProxiedAppLaunchSpec {
+  args: string[];
+  envPatch: Record<string, string>;
+  effectiveMode: 'chromiumArgs' | 'envOnly';
+  httpProxyUrl: string;
+  allProxyUrl: string;
+}
+
+/**
+ * Builds isolated process-scoped environment variables and CLI flags to launch
+ * a specific desktop application through the local mixed HTTP+SOCKS5 relay port
+ * without touching Windows system proxy or affecting any other running application.
+ */
+export function buildProxiedAppLaunchSpec(
+  appProfile: Pick<ProxiedAppProfile, 'exePath' | 'args' | 'launchMode' | 'isolatedProfile'>,
+  node: Pick<NodeProfile, 'mode' | 'localPort' | 'engine'>,
+  options?: {
+    hasElectronSiblingFiles?: boolean;
+    fallbackActive?: boolean;
+    isolatedProfileDir?: string;
+  }
+): ProxiedAppLaunchSpec {
+  const httpProxyUrl = `http://127.0.0.1:${node.localPort}`;
+  const allProxyUrl =
+    node.mode === 'localForward' ? httpProxyUrl : `socks5h://127.0.0.1:${node.localPort}`;
+
+  const envPatch: Record<string, string> = {
+    HTTP_PROXY: httpProxyUrl,
+    HTTPS_PROXY: httpProxyUrl,
+    http_proxy: httpProxyUrl,
+    https_proxy: httpProxyUrl,
+    ALL_PROXY: allProxyUrl,
+    all_proxy: allProxyUrl,
+    NO_PROXY: 'localhost,127.0.0.1,::1',
+    no_proxy: 'localhost,127.0.0.1,::1',
+  };
+
+  const useChromiumArgs =
+    appProfile.launchMode === 'chromiumArgs' ||
+    (appProfile.launchMode === 'auto' &&
+      isLikelyChromiumOrElectronApp(appProfile.exePath, Boolean(options?.hasElectronSiblingFiles)));
+
+  const args: string[] = [];
+  if (useChromiumArgs) {
+    args.push(`--proxy-server=${httpProxyUrl}`);
+    args.push('--proxy-bypass-list=<-loopback>');
+    const effectiveEngine = options?.fallbackActive ? 'openssh' : (node.engine ?? 'openssh');
+    if (node.mode === 'socks5' && effectiveEngine !== 'hysteria2') {
+      args.push('--disable-quic');
+    }
+    if (appProfile.isolatedProfile && options?.isolatedProfileDir) {
+      args.push(`--user-data-dir=${options.isolatedProfileDir}`);
+    }
+  }
+
+  args.push(...splitCommandArgs(appProfile.args));
+
+  return {
+    args,
+    envPatch,
+    effectiveMode: useChromiumArgs ? 'chromiumArgs' : 'envOnly',
+    httpProxyUrl,
+    allProxyUrl,
+  };
 }

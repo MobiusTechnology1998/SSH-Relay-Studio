@@ -137,4 +137,143 @@ describe('LocalProxyBalancer', () => {
     expect(r1).toBe('NEW:req1');
     expect(r2).toBe('NEW:req2');
   });
+
+  it('transparently bridges HTTP CONNECT requests to a SOCKS5 backend with remote domain resolution', async () => {
+    let capturedHost = '';
+    let capturedPort = 0;
+
+    // Mock SOCKS5 server that accepts NO-AUTH + DOMAIN CONNECT and echoes payload
+    const mockSocks5 = await new Promise<{ port: number }>((resolve, reject) => {
+      const srv = net.createServer((socket) => {
+        let stage = 0;
+        socket.on('data', (chunk) => {
+          if (stage === 0) {
+            stage = 1;
+            socket.write(Buffer.from([0x05, 0x00]));
+          } else if (stage === 1) {
+            stage = 2;
+            const atyp = chunk[3];
+            if (atyp === 0x03) {
+              const len = chunk[4];
+              capturedHost = chunk.subarray(5, 5 + len).toString('utf8');
+              capturedPort = chunk.readUInt16BE(5 + len);
+            }
+            socket.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0]));
+          } else {
+            socket.write(Buffer.from(`TUN:${chunk.toString('utf8')}`));
+          }
+        });
+      });
+      servers.push(srv);
+      srv.once('error', reject);
+      srv.listen(0, '127.0.0.1', () => {
+        const addr = srv.address();
+        if (addr && typeof addr === 'object') resolve({ port: addr.port });
+        else reject(new Error('bind failed'));
+      });
+    });
+
+    const listenPort = await findFreeLocalPort();
+    const balancer = new LocalProxyBalancer();
+    balancer.setMixedHttpBridge(true);
+    balancers.push(balancer);
+    await balancer.start(listenPort);
+    balancer.upsertBackend({ id: 's5', port: mockSocks5.port, healthy: true, latencyMs: 50 });
+
+    const reply = await new Promise<string>((resolve, reject) => {
+      const client = net.connect(listenPort, '127.0.0.1', () => {
+        client.write('CONNECT api.openai.com:443 HTTP/1.1\r\nHost: api.openai.com:443\r\n\r\n');
+      });
+      client.setTimeout(3000);
+      let buf = '';
+      let sentBody = false;
+      client.on('data', (chunk) => {
+        buf += chunk.toString('utf8');
+        if (!sentBody && buf.includes('200 Connection Established\r\n\r\n')) {
+          sentBody = true;
+          client.write('hello-tls');
+        } else if (buf.includes('TUN:hello-tls')) {
+          client.end();
+          resolve(buf);
+        }
+      });
+      client.once('error', reject);
+      client.once('timeout', () => {
+        client.destroy();
+        reject(new Error('timeout'));
+      });
+    });
+
+    expect(capturedHost).toBe('api.openai.com');
+    expect(capturedPort).toBe(443);
+    expect(reply).toContain('HTTP/1.1 200 Connection Established');
+    expect(reply).toContain('TUN:hello-tls');
+
+    await new Promise((r) => setTimeout(r, 30));
+    const stats = balancer.getStats();
+    expect(stats.totalBytesUp).toBeGreaterThanOrEqual(9);
+    expect(stats.totalBytesDown).toBeGreaterThanOrEqual(13);
+  });
+
+  it('transparently bridges plain HTTP proxy requests to a SOCKS5 backend and rewrites origin-form URL', async () => {
+    let capturedHost = '';
+    let capturedPort = 0;
+    let receivedHttp = '';
+
+    const mockSocks5 = await new Promise<{ port: number }>((resolve, reject) => {
+      const srv = net.createServer((socket) => {
+        let stage = 0;
+        socket.on('data', (chunk) => {
+          if (stage === 0) {
+            stage = 1;
+            socket.write(Buffer.from([0x05, 0x00]));
+          } else if (stage === 1) {
+            stage = 2;
+            const len = chunk[4];
+            capturedHost = chunk.subarray(5, 5 + len).toString('utf8');
+            capturedPort = chunk.readUInt16BE(5 + len);
+            socket.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0]));
+          } else {
+            receivedHttp += chunk.toString('latin1');
+            socket.end('HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok');
+          }
+        });
+      });
+      servers.push(srv);
+      srv.once('error', reject);
+      srv.listen(0, '127.0.0.1', () => {
+        const addr = srv.address();
+        if (addr && typeof addr === 'object') resolve({ port: addr.port });
+        else reject(new Error('bind failed'));
+      });
+    });
+
+    const listenPort = await findFreeLocalPort();
+    const balancer = new LocalProxyBalancer();
+    balancer.setMixedHttpBridge(true);
+    balancers.push(balancer);
+    await balancer.start(listenPort);
+    balancer.upsertBackend({ id: 's5', port: mockSocks5.port, healthy: true, latencyMs: 50 });
+
+    const response = await new Promise<string>((resolve, reject) => {
+      const client = net.connect(listenPort, '127.0.0.1', () => {
+        client.write(
+          'GET http://example.com:8080/test?q=1 HTTP/1.1\r\nHost: example.com:8080\r\nProxy-Connection: keep-alive\r\n\r\n'
+        );
+      });
+      client.setTimeout(3000);
+      let buf = '';
+      client.on('data', (chunk) => {
+        buf += chunk.toString('utf8');
+      });
+      client.once('end', () => resolve(buf));
+      client.once('error', reject);
+    });
+
+    expect(capturedHost).toBe('example.com');
+    expect(capturedPort).toBe(8080);
+    expect(receivedHttp).toContain('GET /test?q=1 HTTP/1.1');
+    expect(receivedHttp).not.toContain('Proxy-Connection');
+    expect(response).toContain('HTTP/1.1 200 OK');
+  });
 });

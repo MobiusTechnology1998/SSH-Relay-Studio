@@ -19,6 +19,7 @@ export function getDefaultSettings(): AppSettings {
       disableQuic: true,
       startUrl: 'https://ipinfo.io',
     },
+    proxiedApps: [],
     serverPrefs: {
       targetPort: 53622,
       useAdminAuthorizedKeys: true,
@@ -53,6 +54,7 @@ class SettingsStore {
             ...(parsed.serverPrefs ?? {}),
           },
           nodes: Array.isArray(parsed.nodes) ? parsed.nodes : [],
+          proxiedApps: Array.isArray(parsed.proxiedApps) ? parsed.proxiedApps : [],
         };
         return this.cache;
       }

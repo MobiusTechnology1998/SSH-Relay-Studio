@@ -20,10 +20,12 @@ import type {
   BrowserPrefs,
   EnvironmentInfo,
   NodeProfile,
+  ProxiedAppProfile,
   QuicServerConfigInput,
   ServerOverview,
   TunnelStatus,
 } from '../shared/types';
+import { detectCommonDesktopApps, launchProxiedApp } from './clientA/appLauncher';
 import { setAutoStartEnabled } from './clientA/autostart';
 import { detectInstalledBrowsers, launchProxyBrowser } from './clientA/browserLauncher';
 import { runTunnelDiagnostics } from './clientA/diagnostics';
@@ -419,6 +421,12 @@ function registerIpcHandlers(): void {
     'clientA:launchProxyBrowser',
     (_e, node: Pick<NodeProfile, 'mode' | 'localPort' | 'engine'>, prefs: BrowserPrefs) =>
       launchProxyBrowser(node, prefs, tunnelManager.getStatus().fallbackActive)
+  );
+  ipcMain.handle('clientA:detectDesktopApps', () => detectCommonDesktopApps());
+  ipcMain.handle(
+    'clientA:launchProxiedApp',
+    (_e, appProfile: ProxiedAppProfile, node: Pick<NodeProfile, 'mode' | 'localPort' | 'engine'>) =>
+      launchProxiedApp(appProfile, node, tunnelManager.getStatus().fallbackActive)
   );
   ipcMain.handle(
     'clientA:runDiagnostics',

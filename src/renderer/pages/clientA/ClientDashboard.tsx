@@ -11,6 +11,7 @@ import type {
   EnvironmentInfo,
   KeyPairInfo,
   NodeProfile,
+  ProxiedAppProfile,
   TunnelStatus,
 } from '../../../shared/types';
 import {
@@ -18,6 +19,7 @@ import {
   IconCopy,
   IconGlobe,
   IconKey,
+  IconLaptop,
   IconPower,
   IconRefresh,
   IconShield,
@@ -180,6 +182,15 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
       return;
     }
     const res = await window.relayApi.launchProxyBrowser(activeNode, settings.browser);
+    onNotify(res.ok ? 'success' : 'error', res.message);
+  };
+
+  const handleLaunchProxiedApp = async (item: ProxiedAppProfile) => {
+    if (!activeNode) {
+      onNotify('warn', '请先选择中转节点');
+      return;
+    }
+    const res = await window.relayApi.launchProxiedApp(item, activeNode);
     onNotify(res.ok ? 'success' : 'error', res.message);
   };
 
@@ -556,10 +567,10 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
               <div className="metric-sub">
                 127.0.0.1:{activeNode?.localPort ?? 1080} (
                 {tunnelStatus.activeEngine === 'hysteria2' && !tunnelStatus.fallbackActive
-                  ? 'QUIC Brutal'
+                  ? 'HTTP+SOCKS5 混合'
                   : activeNode?.mode === 'localForward'
                   ? `转发 :${activeNode.remoteProxyPort}`
-                  : 'SOCKS5 调度'}
+                  : 'HTTP+SOCKS5 混合'}
                 )
               </div>
             </div>
@@ -586,6 +597,39 @@ export const ClientDashboard: React.FC<ClientDashboardProps> = ({
                   : ''}
               </div>
             </div>
+          </div>
+
+          {/* Quick Isolated Per-App Proxy Launcher Strip */}
+          <div className="card stack-sm" style={{ padding: '14px 18px' }}>
+            <div className="row-between">
+              <div className="row-wrap" style={{ gap: 8 }}>
+                <IconLaptop size={16} />
+                <strong style={{ fontSize: 13.8 }}>定向代理启动指定应用</strong>
+                <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                  仅该进程走本地代理，系统与其他软件不受影响
+                </span>
+              </div>
+              <button className="btn btn-sm" onClick={() => onNavigate('tools')}>
+                {(settings.proxiedApps ?? []).length > 0 ? '管理应用' : '+ 添加指定应用'}
+              </button>
+            </div>
+            {(settings.proxiedApps ?? []).length > 0 && (
+              <div className="row-wrap" style={{ gap: 8 }}>
+                {(settings.proxiedApps ?? []).map((item) => (
+                  <button
+                    key={item.id}
+                    type="button"
+                    className="btn btn-sm"
+                    onClick={() => handleLaunchProxiedApp(item)}
+                    disabled={!activeNode}
+                    title={`以独立代理环境启动 ${item.exePath}`}
+                  >
+                    <IconLaptop size={13} />
+                    {item.name}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
 
           {/* Per-worker Multi-Tunnel Pool Telemetry */}

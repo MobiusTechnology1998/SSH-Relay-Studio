@@ -46,6 +46,27 @@ export interface BrowserPrefs {
   startUrl: string;
 }
 
+export type ProxiedAppLaunchMode = 'auto' | 'envOnly' | 'chromiumArgs';
+
+export interface ProxiedAppProfile {
+  id: string;
+  name: string;
+  exePath: string;
+  args?: string;
+  cwd?: string;
+  launchMode: ProxiedAppLaunchMode;
+  /** Optional isolated --user-data-dir for Chromium/Electron apps */
+  isolatedProfile?: boolean;
+}
+
+export interface DetectedDesktopApp {
+  id: string;
+  name: string;
+  exePath: string;
+  category: 'editor' | 'terminal' | 'chat' | 'browser' | 'other';
+  suggestedMode: ProxiedAppLaunchMode;
+}
+
 export interface AppSettings {
   role: AppRole;
   nodes: NodeProfile[];
@@ -56,6 +77,7 @@ export interface AppSettings {
   customOpenSshDir?: string; // Optional path to newer Win32-OpenSSH directory (v9.8+)
   customHysteriaPath?: string; // Optional path to hysteria.exe binary
   browser: BrowserPrefs;
+  proxiedApps: ProxiedAppProfile[];
   serverPrefs: {
     targetPort: number;
     useAdminAuthorizedKeys: boolean;
