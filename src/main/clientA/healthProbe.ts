@@ -209,15 +209,15 @@ export function probeTunnelHealth(
  * Probes a Hysteria 2 (QUIC) local SOCKS5 or HTTP proxy end-to-end against Device B's loopback SSH port.
  * Unlike standard SOCKS5 CONNECT probing, Hysteria 2 with `fastOpen: true` immediately acknowledges
  * `CONNECT` locally (0-1ms) and only opens the remote QUIC stream on the first application payload byte.
- * Therefore we send an SSH client banner (`SSH-2.0-RelayProbe\r\n`) and time until Device B's `sshd`
- * replies (or Device B resets the stream), measuring genuine A<->B cross-border QUIC RTT without any
- * external internet dependency.
+ * Therefore we send an SSH client banner (`SSH-2.0-RelayProbe\r\n`) and require actual remote payload bytes
+ * from Device B's `sshd` to confirm end-to-end QUIC liveness; a 0-byte immediate close (which Hysteria 2
+ * emits under `fastOpen: true` when the QUIC session is dead or unreachable) is treated as a probe failure.
  */
 export function probeQuicTunnelHealth(
   mode: TunnelMode,
   localPort: number,
   remoteSshPort: number,
-  timeoutMs = 7000
+  timeoutMs = 10000
 ): Promise<TunnelHealthProbeResult> {
   const safePort = Math.max(1, Math.min(65535, remoteSshPort || 22));
 
@@ -247,8 +247,11 @@ export function probeQuicTunnelHealth(
       socket.once('close', () => {
         if (!settled) {
           if (stage === 'banner') {
-            const latencyMs = Math.max(1, Date.now() - rttStart);
-            finish(true, latencyMs, `QUIC 端到端探活正常 (${latencyMs}ms)`);
+            finish(
+              false,
+              null,
+              'QUIC 远端流未返回响应即断开（底层 QUIC 通道可能已断开或目标不可达）'
+            );
           } else {
             finish(false, null, 'QUIC 探活连接在返回响应前关闭');
           }
@@ -321,9 +324,11 @@ export function probeQuicTunnelHealth(
     socket.once('close', () => {
       if (!settled) {
         if (stage === 'banner') {
-          // Remote Device B closed/refused the stream after completing the QUIC round-trip
-          const latencyMs = Math.max(1, Date.now() - rttStart);
-          finish(true, latencyMs, `QUIC 端到端探活正常 (${latencyMs}ms)`);
+          finish(
+            false,
+            null,
+            'QUIC 远端流未返回响应即断开（底层 QUIC 通道可能已断开或目标不可达）'
+          );
         } else {
           finish(false, null, 'QUIC 探活连接在返回响应前关闭');
         }

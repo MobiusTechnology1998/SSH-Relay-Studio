@@ -19,6 +19,72 @@ function toYamlPath(filePath: string): string {
   return filePath.replace(/\\/g, '/');
 }
 
+export const DEFAULT_QUIC_UP_MBPS = 20;
+export const DEFAULT_QUIC_DOWN_MBPS = 50;
+export const DEFAULT_QUIC_HOP_INTERVAL_SEC = 30;
+
+/**
+ * Validates and normalizes an optional Hysteria 2 UDP port hopping spec
+ * (e.g. "53620-53650" or "53623,53630-53640"), falling back to single `fallbackPort`.
+ */
+export function normalizeQuicPortSpec(
+  portRange: string | undefined,
+  fallbackPort: number
+): { portSpec: string; isMultiPort: boolean } {
+  const raw = (portRange || '').trim();
+  if (!raw) {
+    if (!Number.isInteger(fallbackPort) || fallbackPort < 1 || fallbackPort > 65535) {
+      throw new Error(`无效 QUIC UDP 端口: ${fallbackPort}`);
+    }
+    return { portSpec: String(fallbackPort), isMultiPort: false };
+  }
+
+  const parts = raw
+    .split(',')
+    .map((segment) => segment.replace(/\s+/g, ''))
+    .filter(Boolean);
+
+  if (parts.length === 0) {
+    throw new Error(`无效 QUIC 端口跳跃范围: ${portRange}`);
+  }
+
+  const normalizedParts: string[] = [];
+  let isMultiPort = parts.length > 1;
+
+  for (const part of parts) {
+    const singleMatch = part.match(/^(\d+)$/);
+    if (singleMatch) {
+      const p = Number.parseInt(singleMatch[1], 10);
+      if (p < 1 || p > 65535) {
+        throw new Error(`QUIC 端口超出 1-65535 范围: ${part}`);
+      }
+      normalizedParts.push(String(p));
+      continue;
+    }
+
+    const rangeMatch = part.match(/^(\d+)-(\d+)$/);
+    if (rangeMatch) {
+      const start = Number.parseInt(rangeMatch[1], 10);
+      const end = Number.parseInt(rangeMatch[2], 10);
+      if (start < 1 || end > 65535 || start > end) {
+        throw new Error(`无效 QUIC 端口跳跃区间: ${part}`);
+      }
+      if (end > start) {
+        isMultiPort = true;
+      }
+      normalizedParts.push(start === end ? String(start) : `${start}-${end}`);
+      continue;
+    }
+
+    throw new Error(`无效 QUIC 端口跳跃格式: ${part}（示例：53620-53650）`);
+  }
+
+  return {
+    portSpec: normalizedParts.join(','),
+    isMultiPort,
+  };
+}
+
 /**
  * Generates a production Hysteria 2 server YAML config tuned for cross-border weak networks.
  */
@@ -57,6 +123,15 @@ export function buildHysteriaServerYaml(params: HysteriaServerYamlParams): strin
   }
 
   lines.push(
+    'quic:',
+    '  initStreamReceiveWindow: 8388608',
+    '  maxStreamReceiveWindow: 8388608',
+    '  initConnReceiveWindow: 20971520',
+    '  maxConnReceiveWindow: 20971520',
+    '  maxIdleTimeout: 60s',
+    '  maxIncomingStreams: 1024',
+    '  disablePathMTUDiscovery: false',
+    '',
     'bandwidth:',
     `  up: ${upMbps} mbps`,
     `  down: ${downMbps} mbps`,
@@ -76,9 +151,10 @@ export function buildHysteriaServerYaml(params: HysteriaServerYamlParams): strin
 
 /**
  * Generates a Hysteria 2 client YAML config tuned for cross-border high-RTT & packet-loss links:
- * - Brutal congestion control with explicit up/down bandwidth
+ * - Conservative Brutal default (20/50 Mbps) to avoid UDP QoS throttling on congested cross-border links
+ * - Optional UDP port hopping (`quicPortRange` + `transport.udp.hopInterval`)
  * - Enlarged QUIC stream (8MB) & connection (20MB) receive windows for high-BDP cross-border links
- * - fastOpen: true (0-RTT-like stream open) + 10s QUIC keepalive
+ * - fastOpen: true (0-RTT-like stream open) + resilient 5s QUIC keepalive / 60s idle timeout
  * - Strict TLS SHA-256 certificate pinning (pinSHA256) against Device B's self-signed cert
  * - Native SOCKS5 (TCP + UDP ASSOCIATE) or HTTP listener on 127.0.0.1:<localPort>
  */
@@ -92,27 +168,40 @@ export function buildHysteriaClientYaml(
   const pin = (node.quicCertPinSha256 || '').trim();
   const sni = (node.quicSni || 'www.bing.com').trim();
   const obfs = (node.quicObfsPassword || '').trim();
-  const upMbps = Math.max(5, Math.min(2000, Math.round(node.quicUpMbps ?? 50)));
-  const downMbps = Math.max(10, Math.min(5000, Math.round(node.quicDownMbps ?? 200)));
+  const upMbps = Math.max(5, Math.min(2000, Math.round(node.quicUpMbps ?? DEFAULT_QUIC_UP_MBPS)));
+  const downMbps = Math.max(10, Math.min(5000, Math.round(node.quicDownMbps ?? DEFAULT_QUIC_DOWN_MBPS)));
+  const hopSec = Math.max(
+    10,
+    Math.min(300, Math.round(node.quicHopIntervalSec ?? DEFAULT_QUIC_HOP_INTERVAL_SEC))
+  );
   const listenPort = listenPortOverride ?? node.localPort;
 
   if (!host) {
     throw new Error('节点主机地址不能为空');
   }
-  if (!Number.isInteger(udpPort) || udpPort < 1 || udpPort > 65535) {
-    throw new Error(`无效 QUIC UDP 端口: ${udpPort}`);
-  }
   if (!auth) {
     throw new Error('缺少 QUIC 鉴权密钥，请重新导入设备 B 配对码或手动填写');
   }
 
-  const serverAddr = host.includes(':') && !host.startsWith('[') ? `[${host}]:${udpPort}` : `${host}:${udpPort}`;
+  const { portSpec, isMultiPort } = normalizeQuicPortSpec(node.quicPortRange, udpPort);
+  const serverAddr =
+    host.includes(':') && !host.startsWith('[') ? `[${host}]:${portSpec}` : `${host}:${portSpec}`;
 
   const lines: string[] = [
     `server: ${yamlQuote(serverAddr)}`,
     `auth: ${yamlQuote(auth)}`,
     '',
   ];
+
+  if (isMultiPort) {
+    lines.push(
+      'transport:',
+      '  type: udp',
+      '  udp:',
+      `    hopInterval: ${hopSec}s`,
+      ''
+    );
+  }
 
   if (obfs) {
     lines.push(
@@ -143,8 +232,8 @@ export function buildHysteriaClientYaml(
     '  maxStreamReceiveWindow: 8388608',
     '  initConnReceiveWindow: 20971520',
     '  maxConnReceiveWindow: 20971520',
-    '  maxIdleTimeout: 30s',
-    '  keepAlivePeriod: 10s',
+    '  maxIdleTimeout: 60s',
+    '  keepAlivePeriod: 5s',
     '  disablePathMTUDiscovery: false',
     '',
     'fastOpen: true',

@@ -26,15 +26,18 @@ import {
 } from '../platform/shell';
 import { probeTunnelHealth } from './healthProbe';
 import { findFreeLocalPort, LocalProxyBalancer } from './localProxyBalancer';
-import { QuicTunnelEngine } from './quicEngine';
+import { probeQuicRecoverability, QuicTunnelEngine } from './quicEngine';
 
 type StatusListener = (status: TunnelStatus) => void;
 
 const STABLE_RESET_MS = 60_000;
-const HEALTH_PROBE_TIMEOUT_MS = 8000;
+const HEALTH_PROBE_TIMEOUT_MS = 12_000;
 const HEALTH_FAIL_THRESHOLD = 2;
 const WORKER_STAGGER_MS = 350;
 const DRAIN_MAX_WAIT_MS = 30_000;
+const SSH_HANDSHAKE_POLL_LIMIT = 60; // 60 * 500ms = 30s tolerance for high-RTT lossy cross-border links
+const QUIC_RECOVERY_INTERVAL_MS = 5 * 60_000; // Silently probe QUIC recovery every 5 min during SSH fallback
+const RESUME_DEBOUNCE_MS = 5_000;
 
 interface PoolWorker {
   id: string;
@@ -66,6 +69,9 @@ class TunnelManager {
   private metricsTimer: NodeJS.Timeout | null = null;
   private rotationTimer: NodeJS.Timeout | null = null;
   private resumeProbeTimer: NodeJS.Timeout | null = null;
+  private quicRecoveryTimer: NodeJS.Timeout | null = null;
+  private quicRecoveryInFlight = false;
+  private lastResumeAt = 0;
   private desiredRunning = false;
   private runningQuicMode = false;
   private activeNode: NodeProfile | null = null;
@@ -224,6 +230,11 @@ class TunnelManager {
       clearTimeout(this.resumeProbeTimer);
       this.resumeProbeTimer = null;
     }
+    if (this.quicRecoveryTimer) {
+      clearInterval(this.quicRecoveryTimer);
+      this.quicRecoveryTimer = null;
+    }
+    this.quicRecoveryInFlight = false;
   }
 
   private async killChildProcess(child: ChildProcess | null): Promise<void> {
@@ -499,6 +510,50 @@ class TunnelManager {
       }, stepMs);
     }
 
+    // When fallen back from QUIC to OpenSSH, periodically probe QUIC/UDP recovery in isolation
+    // so temporary ISP UDP QoS blackholes do not trap the session on OpenSSH forever.
+    if (isFallback && node.engine === 'hysteria2') {
+      logger.info(
+        'tunnel',
+        `[QUIC 回退] 已开启后台静默探活：每 ${Math.round(QUIC_RECOVERY_INTERVAL_MS / 60_000)} 分钟检测一次 QUIC/UDP 恢复情况，恢复后自动切回高速 QUIC 引擎。`
+      );
+      this.quicRecoveryTimer = setInterval(async () => {
+        if (
+          !this.desiredRunning ||
+          this.runningQuicMode ||
+          epoch !== this.sessionEpoch ||
+          this.quicRecoveryInFlight ||
+          !this.activeNode
+        ) {
+          return;
+        }
+        this.quicRecoveryInFlight = true;
+        try {
+          const targetNode = this.activeNode;
+          const recovered = await probeQuicRecoverability(
+            targetNode,
+            this.customHysteriaPath,
+            15_000
+          );
+          if (
+            recovered &&
+            this.desiredRunning &&
+            !this.runningQuicMode &&
+            epoch === this.sessionEpoch &&
+            this.activeNode
+          ) {
+            logger.success(
+              'tunnel',
+              '[QUIC 自动恢复] 检测到设备 B QUIC/UDP 通道已恢复可用，正在从 OpenSSH 回退池自动切回 QUIC 加速引擎...'
+            );
+            void this.start(this.activeNode);
+          }
+        } finally {
+          this.quicRecoveryInFlight = false;
+        }
+      }, QUIC_RECOVERY_INTERVAL_MS);
+    }
+
     return {
       ok: true,
       message: `正在启动 ${poolSize} 通道并行隧道：${node.name}`,
@@ -693,14 +748,14 @@ class TunnelManager {
             }
           }
         }, STABLE_RESET_MS);
-      } else if (pollAttempts > 40) {
+      } else if (pollAttempts > SSH_HANDSHAKE_POLL_LIMIT) {
         if (worker.listenPollTimer) {
           clearInterval(worker.listenPollTimer);
           worker.listenPollTimer = null;
         }
         logger.warn(
           'tunnel',
-          `[通道 #${worker.slotIndex + 1}] SSH 握手超过 20 秒未监听端口，主动中止并重连...`
+          `[通道 #${worker.slotIndex + 1}] SSH 握手超过 30 秒未监听端口，主动中止并重连...`
         );
         if (!worker.stderrBuffer.trim()) {
           worker.stderrBuffer = 'Connection timed out (SSH 握手超时未监听内部端口)';
@@ -855,7 +910,10 @@ class TunnelManager {
     if (!this.desiredRunning || epoch !== this.sessionEpoch) return;
 
     worker.reconnectCount += 1;
-    const delayMs = computeReconnectDelayMs(worker.reconnectCount);
+    // Stagger multi-worker retries on repeated failures so all slots don't hammer
+    // congested cross-border routes or ISP rate-limiters simultaneously.
+    const slotStaggerMs = worker.reconnectCount >= 2 ? worker.slotIndex * 1200 : 0;
+    const delayMs = computeReconnectDelayMs(worker.reconnectCount) + slotStaggerMs;
     worker.state = 'reconnecting';
     worker.latencyMs = null;
     worker.nextRetryAt = Date.now() + delayMs;
@@ -1031,6 +1089,10 @@ class TunnelManager {
       this.quicEngine.handleSystemResume();
       return;
     }
+
+    const now = Date.now();
+    if (now - this.lastResumeAt < RESUME_DEBOUNCE_MS) return;
+    this.lastResumeAt = now;
 
     const epoch = this.sessionEpoch;
     logger.info('tunnel', '检测到系统休眠唤醒，正在快速校验所有连接池通道...');

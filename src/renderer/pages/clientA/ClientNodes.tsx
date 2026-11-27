@@ -1,5 +1,11 @@
 import React, { useState } from 'react';
 import { formatSshCommandPreview, upsertNodeFromPairing } from '../../../shared/commandBuilders';
+import {
+  DEFAULT_QUIC_DOWN_MBPS,
+  DEFAULT_QUIC_HOP_INTERVAL_SEC,
+  DEFAULT_QUIC_UP_MBPS,
+  normalizeQuicPortSpec,
+} from '../../../shared/hysteriaConfig';
 import { decodePairingToken } from '../../../shared/pairingCodec';
 import type { AppSettings, NodeProfile } from '../../../shared/types';
 import { Modal } from '../../components/Modal';
@@ -35,8 +41,10 @@ function createEmptyNode(): NodeProfile {
     autoFallbackToSsh: true,
     quicUdpPort: 53623,
     quicSni: 'www.bing.com',
-    quicUpMbps: 50,
-    quicDownMbps: 200,
+    quicUpMbps: DEFAULT_QUIC_UP_MBPS,
+    quicDownMbps: DEFAULT_QUIC_DOWN_MBPS,
+    quicPortRange: '',
+    quicHopIntervalSec: DEFAULT_QUIC_HOP_INTERVAL_SEC,
     notes: '',
   };
 }
@@ -63,6 +71,14 @@ export const ClientNodes: React.FC<ClientNodesProps> = ({
     if (editing.localPort < 1024 || editing.localPort > 65535) {
       onNotify('error', '本地代理端口建议设置在 1024-65535 之间');
       return;
+    }
+    if (editing.engine === 'hysteria2' && editing.quicPortRange?.trim()) {
+      try {
+        normalizeQuicPortSpec(editing.quicPortRange, editing.quicUdpPort ?? 53623);
+      } catch (err) {
+        onNotify('error', (err as Error).message);
+        return;
+      }
     }
 
     const exists = settings.nodes.some((n) => n.id === editing.id);
@@ -348,7 +364,7 @@ export const ClientNodes: React.FC<ClientNodesProps> = ({
                 <span>高级弱网与协议参数（已自动设为跨国最优值）</span>
                 <span className="mono" style={{ fontSize: 11.5, color: 'var(--text-muted)' }}>
                   {editing.engine === 'hysteria2'
-                    ? `Brutal ${editing.quicUpMbps ?? 50}/${editing.quicDownMbps ?? 200}M · 备选 SSH ${editing.poolSize ?? 3} 通道`
+                    ? `Brutal ${editing.quicUpMbps ?? DEFAULT_QUIC_UP_MBPS}/${editing.quicDownMbps ?? DEFAULT_QUIC_DOWN_MBPS}M${editing.quicPortRange?.trim() ? ` · 跳端口 ${editing.quicPortRange.trim()}` : ''} · 备选 SSH ${editing.poolSize ?? 3} 通道`
                     : `${editing.mode === 'socks5' ? 'SOCKS5' : '本地转发'} · ${editing.poolSize ?? 3} 通道 · 心跳 ${editing.serverAliveInterval ?? 15}s`}
                 </span>
               </summary>
@@ -399,14 +415,15 @@ export const ClientNodes: React.FC<ClientNodesProps> = ({
                           type="number"
                           min={5}
                           max={2000}
-                          value={editing.quicUpMbps ?? 50}
+                          value={editing.quicUpMbps ?? DEFAULT_QUIC_UP_MBPS}
                           onChange={(e) =>
                             setEditing({
                               ...editing,
-                              quicUpMbps: Math.max(5, Number(e.target.value) || 50),
+                              quicUpMbps: Math.max(5, Number(e.target.value) || DEFAULT_QUIC_UP_MBPS),
                             })
                           }
                         />
+                        <span className="field-hint">请勿高于线路真实带宽（默认 20M，过高易触发 UDP 限流）</span>
                       </div>
                       <div className="field">
                         <label className="field-label">本机下行带宽期望 (Mbps，Brutal)</label>
@@ -415,14 +432,51 @@ export const ClientNodes: React.FC<ClientNodesProps> = ({
                           type="number"
                           min={10}
                           max={5000}
-                          value={editing.quicDownMbps ?? 200}
+                          value={editing.quicDownMbps ?? DEFAULT_QUIC_DOWN_MBPS}
                           onChange={(e) =>
                             setEditing({
                               ...editing,
-                              quicDownMbps: Math.max(10, Number(e.target.value) || 200),
+                              quicDownMbps: Math.max(10, Number(e.target.value) || DEFAULT_QUIC_DOWN_MBPS),
                             })
                           }
                         />
+                        <span className="field-hint">建议贴近云主机峰值（默认 50M，弱网可设为 30M）</span>
+                      </div>
+                    </div>
+                    <div className="grid-2">
+                      <div className="field">
+                        <label className="field-label">UDP 端口跳跃范围（可选，防单端口 QoS）</label>
+                        <input
+                          className="input mono"
+                          value={editing.quicPortRange ?? ''}
+                          onChange={(e) =>
+                            setEditing({ ...editing, quicPortRange: e.target.value })
+                          }
+                          placeholder="例如 53620-53650（留空则单端口）"
+                        />
+                        <span className="field-hint">
+                          需服务端为 Linux 或路由/防火墙配置 UDP 范围 DNAT 转发（Windows 服务端默认单端口请留空）
+                        </span>
+                      </div>
+                      <div className="field">
+                        <label className="field-label">端口跳跃间隔 (秒)</label>
+                        <input
+                          className="input mono"
+                          type="number"
+                          min={10}
+                          max={300}
+                          value={editing.quicHopIntervalSec ?? DEFAULT_QUIC_HOP_INTERVAL_SEC}
+                          onChange={(e) =>
+                            setEditing({
+                              ...editing,
+                              quicHopIntervalSec: Math.max(
+                                10,
+                                Math.min(300, Number(e.target.value) || DEFAULT_QUIC_HOP_INTERVAL_SEC)
+                              ),
+                            })
+                          }
+                        />
+                        <span className="field-hint">仅填写端口跳跃范围时生效，默认 30 秒</span>
                       </div>
                     </div>
                     <label className="checkbox-row">
@@ -433,7 +487,7 @@ export const ClientNodes: React.FC<ClientNodesProps> = ({
                           setEditing({ ...editing, autoFallbackToSsh: e.target.checked })
                         }
                       />
-                      <span>UDP 被屏蔽/握手失败时，自动无缝回退至 OpenSSH 多隧道连接池（强烈推荐）</span>
+                      <span>UDP 被屏蔽/握手失败时，自动无缝回退至 OpenSSH 多隧道连接池（后台每 5 分钟探测恢复后自动切回 QUIC）</span>
                     </label>
                   </div>
                 )}

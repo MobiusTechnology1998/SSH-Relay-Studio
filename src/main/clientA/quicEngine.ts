@@ -8,7 +8,10 @@ import {
 } from '../../shared/commandBuilders';
 import {
   buildHysteriaClientYaml,
+  DEFAULT_QUIC_DOWN_MBPS,
+  DEFAULT_QUIC_UP_MBPS,
   diagnoseHysteriaError,
+  normalizeQuicPortSpec,
 } from '../../shared/hysteriaConfig';
 import type { NodeProfile, TunnelStatus } from '../../shared/types';
 import { logger } from '../logger';
@@ -22,9 +25,127 @@ export interface QuicEngineCallbacks {
   onFallbackToSsh: (reason: string) => void;
 }
 
-const QUIC_STARTUP_TIMEOUT_MS = 12_000;
-const HEALTH_PROBE_TIMEOUT_MS = 7000;
+const QUIC_STARTUP_TIMEOUT_MS = 20_000;
+const HEALTH_PROBE_TIMEOUT_MS = 10_000;
 const HEALTH_FAIL_THRESHOLD = 2;
+const RESUME_DEBOUNCE_MS = 5_000;
+
+async function terminateProcess(child: ChildProcess | null): Promise<void> {
+  if (!child || !child.pid) return;
+  try {
+    if (IS_WINDOWS) {
+      await execCmd('taskkill', ['/F', '/T', '/PID', String(child.pid)], { timeoutMs: 5000 });
+    } else {
+      child.kill('SIGTERM');
+    }
+  } catch {
+    try {
+      child.kill();
+    } catch {
+      // Ignore
+    }
+  }
+}
+
+/**
+ * Non-disruptively probes whether QUIC/UDP to Device B has recovered while Client A is running
+ * in OpenSSH fallback mode. Spawns an isolated temporary Hysteria 2 client on an ephemeral local
+ * port, verifies an end-to-end A<->B QUIC round-trip, and tears down the temporary process.
+ */
+export async function probeQuicRecoverability(
+  node: NodeProfile,
+  customBinaryPath?: string,
+  timeoutMs = 15_000
+): Promise<boolean> {
+  const bin = await inspectHysteriaBinary('clientA', customBinaryPath);
+  if (!bin.installed) return false;
+
+  let tempPort: number;
+  try {
+    tempPort = await findFreeLocalPort();
+  } catch {
+    return false;
+  }
+
+  let yaml: string;
+  try {
+    yaml = buildHysteriaClientYaml(node, tempPort);
+  } catch {
+    return false;
+  }
+
+  const probeConfigPath = path.join(app.getPath('userData'), 'quic-recovery-probe.yaml');
+  try {
+    fs.mkdirSync(path.dirname(probeConfigPath), { recursive: true });
+    fs.writeFileSync(probeConfigPath, yaml, 'utf8');
+  } catch {
+    return false;
+  }
+
+  let child: ChildProcess | null = null;
+  try {
+    child = spawn(bin.path, ['client', '-c', probeConfigPath], {
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    const connected = await new Promise<boolean>((resolve) => {
+      let settled = false;
+      let connectedLogged = false;
+      const startedAt = Date.now();
+
+      const finish = (ok: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearInterval(poll);
+        resolve(ok);
+      };
+
+      const onOutput = (chunk: Buffer) => {
+        const text = decodeSshOutputChunk(chunk).toLowerCase();
+        if (text.includes('connected to server')) {
+          connectedLogged = true;
+        }
+      };
+
+      child?.stdout?.on('data', onOutput);
+      child?.stderr?.on('data', onOutput);
+      child?.once('error', () => finish(false));
+      child?.once('exit', () => finish(false));
+
+      const poll = setInterval(async () => {
+        if (settled) return;
+        const listening = await isLocalPortListening(tempPort);
+        if (settled) return;
+
+        if (listening && (connectedLogged || Date.now() - startedAt >= 2000)) {
+          const probeRes = await probeQuicTunnelHealth(
+            node.mode,
+            tempPort,
+            node.sshPort,
+            Math.min(7000, Math.max(3000, timeoutMs - (Date.now() - startedAt)))
+          );
+          finish(probeRes.ok);
+        } else if (Date.now() - startedAt >= timeoutMs) {
+          finish(false);
+        }
+      }, 450);
+    });
+
+    return connected;
+  } catch {
+    return false;
+  } finally {
+    await terminateProcess(child);
+    try {
+      if (fs.existsSync(probeConfigPath)) {
+        fs.unlinkSync(probeConfigPath);
+      }
+    } catch {
+      // Ignore cleanup errors
+    }
+  }
+}
 
 /**
  * Manages the Hysteria 2 QUIC client process on Device A for cross-border weak networks:
@@ -57,6 +178,7 @@ export class QuicTunnelEngine {
   private prevMetricsAt = 0;
   private lastMetricsFp = '';
   private lastOutput = '';
+  private lastResumeAt = 0;
   private callbacks: QuicEngineCallbacks;
 
   constructor(callbacks: QuicEngineCallbacks) {
@@ -96,20 +218,7 @@ export class QuicTunnelEngine {
   }
 
   private async killChild(child: ChildProcess | null): Promise<void> {
-    if (!child || !child.pid) return;
-    try {
-      if (IS_WINDOWS) {
-        await execCmd('taskkill', ['/F', '/T', '/PID', String(child.pid)], { timeoutMs: 5000 });
-      } else {
-        child.kill('SIGTERM');
-      }
-    } catch {
-      try {
-        child.kill();
-      } catch {
-        // Ignore
-      }
-    }
+    await terminateProcess(child);
   }
 
   public async start(node: NodeProfile, customBinaryPath?: string): Promise<{ ok: boolean; message: string }> {
@@ -264,9 +373,15 @@ export class QuicTunnelEngine {
     this.lastOutput = '';
     let connectedLogged = false;
 
+    let portLabel = String(node.quicUdpPort ?? 53623);
+    try {
+      portLabel = normalizeQuicPortSpec(node.quicPortRange, node.quicUdpPort ?? 53623).portSpec;
+    } catch {
+      // Fall back to base port in log
+    }
     logger.info(
       'tunnel',
-      `[QUIC${isReconnect ? '·重连' : ''}] 启动 Hysteria 2 客户端 -> ${node.host}:${node.quicUdpPort ?? 53623} (Brutal ${node.quicUpMbps ?? 50}/${node.quicDownMbps ?? 200} Mbps)`
+      `[QUIC${isReconnect ? '·重连' : ''}] 启动 Hysteria 2 客户端 -> ${node.host}:${portLabel} (Brutal ${node.quicUpMbps ?? DEFAULT_QUIC_UP_MBPS}/${node.quicDownMbps ?? DEFAULT_QUIC_DOWN_MBPS} Mbps)`
     );
 
     let child: ChildProcess;
@@ -372,7 +487,7 @@ export class QuicTunnelEngine {
           clearInterval(this.pollTimer);
           this.pollTimer = null;
         }
-        this.lastOutput = 'QUIC/UDP 握手超过 12 秒未就绪（可能 UDP 端口未放行或被当前网络屏蔽）';
+        this.lastOutput = 'QUIC/UDP 握手超过 20 秒未就绪（可能 UDP 端口未放行或被当前网络临时限流/屏蔽）';
         logger.warn('tunnel', `[QUIC] ${this.lastOutput}`);
         await this.killChild(child);
       }
@@ -455,13 +570,23 @@ export class QuicTunnelEngine {
           });
         } else {
           const stillListening = await isLocalPortListening(internalPort);
-          if (!stillListening || res.detail.includes('超时')) {
+          if (!stillListening) {
+            this.consecutiveHealthFailures = HEALTH_FAIL_THRESHOLD;
+          } else {
             this.consecutiveHealthFailures += 1;
           }
 
+          logger.warn(
+            'tunnel',
+            `[QUIC] 端到端探活失败 (${this.consecutiveHealthFailures}/${HEALTH_FAIL_THRESHOLD}): ${res.detail}`
+          );
+
           if (this.consecutiveHealthFailures >= HEALTH_FAIL_THRESHOLD) {
-            logger.warn('tunnel', '[QUIC] 连续探活超时，判定 QUIC 通道异常，主动重建...');
-            this.lastOutput = 'QUIC 通道连续探活超时';
+            logger.warn(
+              'tunnel',
+              `[QUIC] 连续 ${this.consecutiveHealthFailures} 次端到端探活失败（${res.detail}），判定 QUIC 通道假死，主动重建...`
+            );
+            this.lastOutput = res.detail || 'QUIC 通道连续探活失败';
             await this.killChild(child);
           }
         }
@@ -493,7 +618,7 @@ export class QuicTunnelEngine {
     if (node.autoFallbackToSsh !== false && this.consecutiveStartupFailures >= 2) {
       logger.warn(
         'tunnel',
-        `[QUIC] 连续 ${this.consecutiveStartupFailures} 次连接失败（${reason}），触发跨网容灾：自动无缝回退至 OpenSSH 多隧道连接池！`
+        `[QUIC] 连续 ${this.consecutiveStartupFailures} 次连接失败（${reason}），触发跨网容灾：自动无缝回退至 OpenSSH 多隧道连接池（后台将定期探活并在 UDP 恢复后自动切回 QUIC）！`
       );
       this.desiredRunning = false;
       this.sessionEpoch += 1;
@@ -538,6 +663,10 @@ export class QuicTunnelEngine {
 
   public handleSystemResume(): void {
     if (!this.desiredRunning || !this.activeNode) return;
+    const now = Date.now();
+    if (now - this.lastResumeAt < RESUME_DEBOUNCE_MS) return;
+    this.lastResumeAt = now;
+
     const epoch = this.sessionEpoch;
     logger.info('tunnel', '[QUIC] 检测到系统休眠唤醒，正在快速重启 QUIC 通道以刷新 NAT 映射...');
     if (this.resumeTimer) clearTimeout(this.resumeTimer);

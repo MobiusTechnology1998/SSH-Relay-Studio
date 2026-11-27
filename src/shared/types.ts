@@ -32,8 +32,10 @@ export interface NodeProfile {
   quicCertPinSha256?: string;
   quicSni?: string; // Default 'www.bing.com'
   quicObfsPassword?: string; // Optional Salamander obfuscation password
-  quicUpMbps?: number; // Default 50 (client upload Mbps for Brutal congestion control)
-  quicDownMbps?: number; // Default 200 (client download Mbps for Brutal congestion control)
+  quicUpMbps?: number; // Default 20 (client upload Mbps for Brutal congestion control)
+  quicDownMbps?: number; // Default 50 (client download Mbps for Brutal congestion control)
+  quicPortRange?: string; // Optional UDP port hopping spec, e.g. "53620-53650" (requires server/router DNAT)
+  quicHopIntervalSec?: number; // Optional port hopping interval in seconds (default 30, range 10-300)
   notes?: string;
 }
 

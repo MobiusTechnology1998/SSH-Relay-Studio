@@ -1,3 +1,8 @@
+import {
+  DEFAULT_QUIC_DOWN_MBPS,
+  DEFAULT_QUIC_HOP_INTERVAL_SEC,
+  DEFAULT_QUIC_UP_MBPS,
+} from './hysteriaConfig';
 import type {
   BrowserPrefs,
   FirewallRuleInfo,
@@ -177,10 +182,13 @@ export function buildTerminalProxySnippets(
  * 2nd retry: 2s
  * 3rd retry: 4s
  * 4th retry: 8s
- * 5th+ retry: 15s cap
+ * 5th retry: 15s
+ * 6th retry: 30s (anti-storm cooldown for ISP QoS / temporary throttling)
+ * 7th retry: 45s
+ * 8th+ retry: 60s cap
  */
 export function computeReconnectDelayMs(attempt: number, jitterRatio = 0.15): number {
-  const schedule = [1000, 2000, 4000, 8000, 15000];
+  const schedule = [1000, 2000, 4000, 8000, 15000, 30000, 45000, 60000];
   const idx = Math.max(0, Math.min(schedule.length - 1, Math.floor(attempt) - 1));
   const base = schedule[idx];
   if (jitterRatio <= 0) return base;
@@ -367,8 +375,10 @@ export function computeNodeConfigHash(node: NodeProfile): string {
     node.quicCertPinSha256 ?? '',
     node.quicSni ?? 'www.bing.com',
     node.quicObfsPassword ?? '',
-    node.quicUpMbps ?? 50,
-    node.quicDownMbps ?? 200,
+    node.quicUpMbps ?? DEFAULT_QUIC_UP_MBPS,
+    node.quicDownMbps ?? DEFAULT_QUIC_DOWN_MBPS,
+    (node.quicPortRange ?? '').trim(),
+    node.quicHopIntervalSec ?? DEFAULT_QUIC_HOP_INTERVAL_SEC,
   ]);
 }
 
@@ -502,8 +512,8 @@ export function upsertNodeFromPairing(
     quicCertPinSha256: payload.quic?.certPinSha256,
     quicSni: payload.quic?.sni ?? 'www.bing.com',
     quicObfsPassword: payload.quic?.obfsPassword,
-    quicUpMbps: 50,
-    quicDownMbps: 200,
+    quicUpMbps: DEFAULT_QUIC_UP_MBPS,
+    quicDownMbps: DEFAULT_QUIC_DOWN_MBPS,
   };
 
   return {

@@ -4,6 +4,7 @@ import {
   buildHysteriaClientYaml,
   buildHysteriaServerYaml,
   diagnoseHysteriaError,
+  normalizeQuicPortSpec,
   parseOpenSshVersion,
 } from '../src/shared/hysteriaConfig';
 import { generateSelfSignedTlsCert } from '../src/main/platform/selfSignedCert';
@@ -47,7 +48,7 @@ describe('hysteriaConfig & selfSignedCert', () => {
     expect(x509.checkPrivateKey(privKey)).toBe(true);
   });
 
-  it('builds Hysteria 2 server YAML with forward-slash Windows paths and Salamander obfs', () => {
+  it('builds Hysteria 2 server YAML with forward-slash Windows paths, weak-network QUIC tuning, and Salamander obfs', () => {
     const yaml = buildHysteriaServerYaml({
       udpPort: 53623,
       certPath: 'C:\\ProgramData\\SSHRelayStudio\\quic\\server.crt',
@@ -64,11 +65,12 @@ describe('hysteriaConfig & selfSignedCert', () => {
     expect(yaml).toContain('password: "my-secret"');
     expect(yaml).toContain('type: salamander');
     expect(yaml).toContain('password: "my-obfs"');
+    expect(yaml).toContain('maxIdleTimeout: 60s');
     expect(yaml).toContain('up: 300 mbps');
     expect(yaml).toContain('down: 500 mbps');
   });
 
-  it('builds Hysteria 2 client YAML with Brutal bandwidth, large QUIC windows, pinSHA256, and SOCKS5/HTTP listener', () => {
+  it('builds Hysteria 2 client YAML with Brutal bandwidth, resilient QUIC keepalive/idle timeouts, pinSHA256, and SOCKS5/HTTP listener', () => {
     const socksYaml = buildHysteriaClientYaml(QUIC_NODE);
     expect(socksYaml).toContain('server: "203.0.113.20:53623"');
     expect(socksYaml).toContain('auth: "secret-token-123"');
@@ -76,8 +78,19 @@ describe('hysteriaConfig & selfSignedCert', () => {
     expect(socksYaml).toContain('type: salamander');
     expect(socksYaml).toContain('up: 50 mbps');
     expect(socksYaml).toContain('down: 200 mbps');
+    expect(socksYaml).toContain('maxIdleTimeout: 60s');
+    expect(socksYaml).toContain('keepAlivePeriod: 5s');
     expect(socksYaml).toContain('fastOpen: true');
+    expect(socksYaml).not.toContain('hopInterval:');
     expect(socksYaml).toContain('socks5:\n  listen: 127.0.0.1:1080');
+
+    const defaultBwYaml = buildHysteriaClientYaml({
+      ...QUIC_NODE,
+      quicUpMbps: undefined,
+      quicDownMbps: undefined,
+    });
+    expect(defaultBwYaml).toContain('up: 20 mbps');
+    expect(defaultBwYaml).toContain('down: 50 mbps');
 
     const httpYaml = buildHysteriaClientYaml({
       ...QUIC_NODE,
@@ -87,6 +100,28 @@ describe('hysteriaConfig & selfSignedCert', () => {
     });
     expect(httpYaml).not.toContain('salamander');
     expect(httpYaml).toContain('http:\n  listen: 127.0.0.1:7890');
+  });
+
+  it('supports optional UDP port hopping and validates port range syntax', () => {
+    const hopYaml = buildHysteriaClientYaml({
+      ...QUIC_NODE,
+      quicPortRange: '53620-53650',
+      quicHopIntervalSec: 45,
+    });
+    expect(hopYaml).toContain('server: "203.0.113.20:53620-53650"');
+    expect(hopYaml).toContain('transport:\n  type: udp\n  udp:\n    hopInterval: 45s');
+
+    expect(normalizeQuicPortSpec(' 53623 , 53630 - 53640 ', 53623)).toEqual({
+      portSpec: '53623,53630-53640',
+      isMultiPort: true,
+    });
+    expect(normalizeQuicPortSpec('', 53623)).toEqual({
+      portSpec: '53623',
+      isMultiPort: false,
+    });
+    expect(() => normalizeQuicPortSpec('53650-53620', 53623)).toThrow();
+    expect(() => normalizeQuicPortSpec('abc-def', 53623)).toThrow();
+    expect(() => normalizeQuicPortSpec('70000', 53623)).toThrow();
   });
 
   it('parses Win32-OpenSSH and portable OpenSSH versions and flags legacy < 9.0 builds', () => {

@@ -141,4 +141,47 @@ describe('healthProbe', () => {
     expect(res.latencyMs).not.toBeNull();
     expect(res.latencyMs!).toBeGreaterThanOrEqual(35);
   });
+
+  it('rejects dead fastOpen QUIC SOCKS5 session that closes immediately with 0 remote bytes', async () => {
+    const port = await startMockServer((socket) => {
+      let step = 0;
+      socket.on('data', () => {
+        if (step === 0) {
+          step = 1;
+          socket.write(Buffer.from([0x05, 0x00]));
+        } else if (step === 1) {
+          step = 2;
+          // Local fastOpen CONNECT ACK
+          socket.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
+        } else if (step === 2) {
+          // Simulate dead QUIC session: local proxy closes immediately without any remote banner
+          socket.end();
+        }
+      });
+    });
+
+    const res = await probeQuicTunnelHealth('socks5', port, 53622, 2000);
+    expect(res.ok).toBe(false);
+    expect(res.latencyMs).toBeNull();
+    expect(res.detail).toContain('未返回响应');
+  });
+
+  it('rejects dead fastOpen QUIC HTTP CONNECT session that closes immediately with 0 remote bytes', async () => {
+    const port = await startMockServer((socket) => {
+      let step = 0;
+      socket.on('data', () => {
+        if (step === 0) {
+          step = 1;
+          socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        } else if (step === 1) {
+          socket.end();
+        }
+      });
+    });
+
+    const res = await probeQuicTunnelHealth('localForward', port, 53622, 2000);
+    expect(res.ok).toBe(false);
+    expect(res.latencyMs).toBeNull();
+    expect(res.detail).toContain('未返回响应');
+  });
 });

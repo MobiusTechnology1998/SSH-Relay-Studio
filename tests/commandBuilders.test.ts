@@ -139,13 +139,16 @@ describe('commandBuilders', () => {
     expect(args.some((a) => a.startsWith('--host-resolver-rules='))).toBe(true);
   });
 
-  it('computes exponential backoff reconnect delays with cap and jitter bounds', () => {
+  it('computes exponential backoff reconnect delays with anti-storm cooldown cap and jitter bounds', () => {
     expect(computeReconnectDelayMs(1, 0)).toBe(1000);
     expect(computeReconnectDelayMs(2, 0)).toBe(2000);
     expect(computeReconnectDelayMs(3, 0)).toBe(4000);
     expect(computeReconnectDelayMs(4, 0)).toBe(8000);
     expect(computeReconnectDelayMs(5, 0)).toBe(15000);
-    expect(computeReconnectDelayMs(12, 0)).toBe(15000);
+    expect(computeReconnectDelayMs(6, 0)).toBe(30000);
+    expect(computeReconnectDelayMs(7, 0)).toBe(45000);
+    expect(computeReconnectDelayMs(8, 0)).toBe(60000);
+    expect(computeReconnectDelayMs(12, 0)).toBe(60000);
 
     for (let i = 0; i < 20; i++) {
       const jittered = computeReconnectDelayMs(3, 0.15);

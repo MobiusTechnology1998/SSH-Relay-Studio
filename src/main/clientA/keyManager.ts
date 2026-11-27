@@ -142,8 +142,8 @@ export async function scanHostKeys(host: string, port: number): Promise<HostKeyS
   const keyscan = resolveOpenSshBinary('ssh-keyscan');
   const res = await execCmd(
     keyscan,
-    ['-T', '8', '-p', String(port), '-t', 'ed25519,rsa,ecdsa', cleanHost],
-    { timeoutMs: 12000 }
+    ['-T', '15', '-p', String(port), '-t', 'ed25519,rsa,ecdsa', cleanHost],
+    { timeoutMs: 20000 }
   );
 
   const lines = res.stdout
